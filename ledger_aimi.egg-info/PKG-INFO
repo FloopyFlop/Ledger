@@ -1,0 +1,102 @@
+Metadata-Version: 2.4
+Name: ledger-aimi
+Version: 0.1.0
+Summary: AI-MI publication tracking and funding-acknowledgment crawler
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: beautifulsoup4>=4.12.0
+Requires-Dist: cloudscraper>=1.2.71
+Requires-Dist: lxml>=5.2.0
+Requires-Dist: pypdf>=5.0.0
+Requires-Dist: requests>=2.32.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+
+# Ledger
+
+Ledger is a proxy-only, stateless paper collector for AI-MI faculty.
+
+Each run starts from scratch, scrapes the AI-MI team page, queries multiple scholarly sources, and writes a standardized canonical dataset locally.
+
+## What it collects
+
+Enabled by default:
+
+1. DBLP
+2. OpenAlex
+3. Semantic Scholar
+4. Crossref
+5. arXiv
+6. Google Scholar
+
+For each source hit, Ledger stores normalized fields (title, year, DOI, authors, URLs, matched AIMI member, and source metadata), then deduplicates into canonical paper records.
+
+## Proxy policy
+
+Ledger enforces proxy-only networking. If no proxy is configured, it fails fast.
+
+Set proxy credentials in `.env`:
+
+```bash
+LEDGER_PROXY_URL=http://user:pass@host:port
+```
+
+## Quick start
+
+```bash
+cd /Users/abm/XVOL/Cornell/AIMI/Ledger
+cp .env.example .env
+uv sync --extra dev
+uv run ledger
+```
+
+Optional overrides:
+
+```bash
+uv run ledger --env-file .env --lookback-years 3 --member-limit 10
+```
+
+## Output layout
+
+Each run writes to `output/runs/<timestamp>/`:
+
+- `members.json`
+- `sources/dblp.json`
+- `sources/openalex.json`
+- `sources/semantic_scholar.json`
+- `sources/crossref.json`
+- `sources/arxiv.json`
+- `sources/google_scholar.json`
+- `source_errors.json`
+- `papers_canonical.json`
+- `papers_with_award_mention.json`
+- `papers_without_award_mention.json`
+- `summary.json`
+- `report.md`
+
+Latest snapshots are also copied to `output/latest/`.
+
+## Standardized schema
+
+Canonical papers (`papers_canonical.json`) include:
+
+- `canonical_id`
+- `title`
+- `year`
+- `published_date`
+- `venue`
+- `doi`
+- `authors`
+- `aimi_members`
+- `abstract`
+- `urls`
+- `pdf_urls`
+- `sources`
+- `source_records`
+- `award_mentioned_in_metadata`
+- `award_mentions`
+
+## Notes
+
+- Google Scholar can rate-limit or challenge traffic; Ledger records source errors and continues.
+- Award matching is metadata-based (title/abstract/snippet), not full-PDF acknowledgment extraction.
