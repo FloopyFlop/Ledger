@@ -120,6 +120,24 @@ def _normalize_proxy_url(value: str | None) -> str | None:
     return normalized
 
 
+def _normalize_arxiv_api_url(value: str | None, default: str) -> str:
+    raw = _clean_optional(value) or default
+    if "://" not in raw:
+        raw = f"http://{raw.lstrip('/')}"
+    parsed = urllib.parse.urlsplit(raw)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or "/api/query"
+
+    if host == "export.arxiv.org" and scheme in {"", "https"}:
+        scheme = "http"
+    elif not scheme:
+        scheme = "https"
+
+    netloc = parsed.netloc or host
+    return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
+
+
 def _normalize_name_key(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalpha())
 
@@ -179,6 +197,10 @@ class LedgerConfig:
     workers: int = 2
     max_results_per_member_per_source: int = 300
     max_google_scholar_pages: int = 2
+    scan_pdfs_for_awards: bool = True
+    pdf_scan_max_mb: int = 30
+    pdf_scan_max_pages: int = 120
+    pdf_scan_max_candidates_per_paper: int = 3
     include_raw_payloads: bool = False
     probe_sources_before_collection: bool = True
     fallback_member_names: list[str] = field(default_factory=lambda: list(DEFAULT_AIMI_MEMBER_NAMES))
@@ -265,6 +287,10 @@ class LedgerConfig:
             workers=max(1, _get_int("LEDGER_WORKERS", 2)),
             max_results_per_member_per_source=max(10, _get_int("LEDGER_MAX_RESULTS_PER_MEMBER_PER_SOURCE", 300)),
             max_google_scholar_pages=max(1, _get_int("LEDGER_MAX_GOOGLE_SCHOLAR_PAGES", 2)),
+            scan_pdfs_for_awards=_get_bool("LEDGER_SCAN_PDFS_FOR_AWARDS", True),
+            pdf_scan_max_mb=max(1, _get_int("LEDGER_PDF_SCAN_MAX_MB", 30)),
+            pdf_scan_max_pages=max(1, _get_int("LEDGER_PDF_SCAN_MAX_PAGES", 120)),
+            pdf_scan_max_candidates_per_paper=max(1, _get_int("LEDGER_PDF_SCAN_MAX_CANDIDATES_PER_PAPER", 3)),
             include_raw_payloads=_get_bool("LEDGER_INCLUDE_RAW_PAYLOADS", False),
             probe_sources_before_collection=_get_bool("LEDGER_PROBE_SOURCES_BEFORE_COLLECTION", True),
             fallback_member_names=_parse_list_env("LEDGER_MEMBER_NAMES", DEFAULT_AIMI_MEMBER_NAMES),
@@ -286,7 +312,7 @@ class LedgerConfig:
                 defaults.semantic_scholar_author_papers_api_template,
             ),
             crossref_works_api=os.getenv("LEDGER_CROSSREF_WORKS_API", defaults.crossref_works_api),
-            arxiv_api=os.getenv("LEDGER_ARXIV_API", defaults.arxiv_api),
+            arxiv_api=_normalize_arxiv_api_url(os.getenv("LEDGER_ARXIV_API"), defaults.arxiv_api),
             google_scholar_search_url=os.getenv("LEDGER_GOOGLE_SCHOLAR_SEARCH_URL", defaults.google_scholar_search_url),
             google_scholar_serpapi_api=os.getenv("LEDGER_GOOGLE_SCHOLAR_SERPAPI_API", defaults.google_scholar_serpapi_api),
             sources=sources,

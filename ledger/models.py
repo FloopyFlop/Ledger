@@ -102,6 +102,11 @@ class CanonicalPaper:
     source_records: list[dict[str, Any]] = field(default_factory=list)
     award_mentioned_in_metadata: bool = False
     award_mentions: list[str] = field(default_factory=list)
+    award_mentioned_in_document: bool = False
+    document_award_mentions: list[str] = field(default_factory=list)
+    document_award_context: str | None = None
+    document_pdf_url: str | None = None
+    document_scan_error: str | None = None
 
 
 @dataclass(slots=True)

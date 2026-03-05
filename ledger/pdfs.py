@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import logging
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -13,6 +14,10 @@ from .net import HttpClient
 ARXIV_ABS_RE = re.compile(r"arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", re.IGNORECASE)
 ARXIV_PDF_RE = re.compile(r"arxiv\.org/pdf/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)\.pdf", re.IGNORECASE)
 DOI_ARXIV_RE = re.compile(r"10\.48550/arXiv\.([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", re.IGNORECASE)
+
+# Keep logs focused on actionable scan failures we return, not parser internals.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
 
 

@@ -5,6 +5,7 @@ import logging
 import re
 import sys
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,9 +19,10 @@ from .collectors import (
     collect_semantic_scholar_for_member,
 )
 from .config import LedgerConfig
-from .funding import compile_award_regexes, find_award_mentions
+from .funding import compile_award_regexes, find_award_context, find_award_mentions
 from .models import CanonicalPaper, CollectionRunSummary, Member, SourcePaperRecord, to_json_dict
 from .net import HttpClient
+from .pdfs import download_pdf, extract_text_from_pdf, safe_file_stem
 from .team import parse_team_members
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,7 @@ def run_ledger(
     member_limit_override: int | None = None,
     lookback_years_override: int | None = None,
 ) -> CollectionRunSummary:
+    run_clock_start = time.monotonic()
     if not (config.proxy.http or config.proxy.https or config.proxy.pool):
         raise RuntimeError("Proxy is required by policy. Set LEDGER_PROXY_URL/HTTP/HTTPS in .env.")
 
@@ -134,6 +137,7 @@ def run_ledger(
 
     active_sources = list(enabled_sources)
     if config.probe_sources_before_collection and enabled_sources:
+        probe_started = time.monotonic()
         probed_active: list[str] = []
         for source_name in enabled_sources:
             ok, message = _probe_source_connectivity(
@@ -160,11 +164,18 @@ def run_ledger(
                 _write_json(run_dir / "sources" / f"{source_name}.json", [])
                 logger.warning("Skipping source %s after failed proxy probe: %s", source_name, message)
         active_sources = probed_active
+        logger.info(
+            "Source probe stage completed in %s (%d active / %d enabled)",
+            _format_elapsed(time.monotonic() - probe_started),
+            len(active_sources),
+            len(enabled_sources),
+        )
     else:
         for source_name in enabled_sources:
             source_probe_status[source_name] = "not_checked"
 
     for source_name in active_sources:
+        source_started = time.monotonic()
         logger.info("Collecting %s records for %d member(s)", source_name, len(members))
         records, errors = _collect_source_for_members(
             source_name=source_name,
@@ -184,17 +195,66 @@ def run_ledger(
 
         _write_json(run_dir / "sources" / f"{source_name}.json", [to_json_dict(record) for record in records])
         logger.info(
-            "Finished %s: %d record(s), %d error(s)",
+            "Finished %s: %d record(s), %d error(s) in %s",
             source_name,
             len(records),
             len(errors),
+            _format_elapsed(time.monotonic() - source_started),
         )
 
     status.clear()
 
     all_records = [record for records in source_records_by_name.values() for record in records]
     award_regexes = compile_award_regexes(config.award_patterns)
+    canonicalize_started = time.monotonic()
     canonical_papers = _canonicalize_records(all_records, award_regexes=award_regexes)
+    logger.info(
+        "Canonicalized %d raw records into %d papers in %s",
+        len(all_records),
+        len(canonical_papers),
+        _format_elapsed(time.monotonic() - canonicalize_started),
+    )
+
+    enrich_started = time.monotonic()
+    enrich_stats = _enrich_pdf_candidates(canonical_papers, client=client, config=config, status=status)
+    status.clear()
+    logger.info(
+        (
+            "PDF candidate enrichment completed in %s "
+            "(papers=%d, with_pdf=%d, newly_filled=%d, doi_lookups=%d)"
+        ),
+        _format_elapsed(time.monotonic() - enrich_started),
+        enrich_stats["papers_total"],
+        enrich_stats["papers_with_pdf_after_enrich"],
+        enrich_stats["filled_count"],
+        enrich_stats["doi_lookup_count"],
+    )
+
+    if config.scan_pdfs_for_awards:
+        scan_started = time.monotonic()
+        scan_stats = _scan_awards_from_documents(
+            papers=canonical_papers,
+            client=client,
+            run_dir=run_dir,
+            award_regexes=award_regexes,
+            max_pdf_mb=config.pdf_scan_max_mb,
+            max_pages=config.pdf_scan_max_pages,
+            max_candidates_per_paper=config.pdf_scan_max_candidates_per_paper,
+            status=status,
+        )
+        status.clear()
+        logger.info(
+            (
+                "Document award scan completed in %s "
+                "(papers=%d, mentions=%d, no_pdf=%d, download_fail=%d, extract_fail=%d)"
+            ),
+            _format_elapsed(time.monotonic() - scan_started),
+            scan_stats["papers_total"],
+            scan_stats["mentions_count"],
+            scan_stats["no_pdf_count"],
+            scan_stats["download_fail_count"],
+            scan_stats["extract_fail_count"],
+        )
     canonical_papers.sort(key=lambda paper: ((paper.year or 0), paper.title.lower()), reverse=True)
 
     papers_with_award = [paper for paper in canonical_papers if paper.award_mentioned_in_metadata]
@@ -247,6 +307,8 @@ def run_ledger(
         latest_dir / "papers_with_award_mention.json",
         [to_json_dict(paper) for paper in papers_with_award],
     )
+
+    logger.info("Ledger pipeline finished in %s", _format_elapsed(time.monotonic() - run_clock_start))
 
     return summary
 
@@ -411,6 +473,231 @@ def _canonicalize_records(
     return list(merged.values())
 
 
+def _enrich_pdf_candidates(
+    papers: list[CanonicalPaper],
+    *,
+    client: HttpClient,
+    config: LedgerConfig,
+    status: _LiveStatus | None = None,
+) -> dict[str, int]:
+    total = len(papers)
+    stage_started = time.monotonic()
+    doi_cache: dict[str, list[str]] = {}
+    lookup_count = 0
+    filled_count = 0
+
+    for idx, paper in enumerate(papers, start=1):
+        had_pdf = bool(paper.pdf_urls)
+        paper.pdf_urls = _derive_pdf_candidates_for_canonical(paper)
+        doi = (paper.doi or "").lower()
+        if paper.pdf_urls or not doi:
+            if not had_pdf and paper.pdf_urls:
+                filled_count += 1
+        else:
+            if doi not in doi_cache:
+                lookup_count += 1
+                doi_cache[doi] = _lookup_openalex_pdf_candidates_for_doi(client=client, config=config, doi=doi)
+            if doi_cache[doi]:
+                paper.pdf_urls = _merge_string_lists(paper.pdf_urls, doi_cache[doi])
+                filled_count += 1
+
+        if status:
+            status.update(
+                (
+                    f"[paper-enrich] {_progress_bar(idx, total)} {idx}/{total} "
+                    f"| filled {filled_count} | doi_lookups {lookup_count} "
+                    f"| elapsed {_format_elapsed(time.monotonic() - stage_started)}"
+                ),
+                force=(idx == total),
+                min_interval=0.1,
+            )
+    return {
+        "papers_total": total,
+        "papers_with_pdf_after_enrich": sum(1 for paper in papers if bool(paper.pdf_urls)),
+        "filled_count": filled_count,
+        "doi_lookup_count": lookup_count,
+    }
+
+
+def _derive_pdf_candidates_for_canonical(paper: CanonicalPaper) -> list[str]:
+    candidates: list[str] = []
+    candidates = _merge_string_lists(candidates, paper.pdf_urls)
+
+    hints: list[str] = []
+    if paper.doi:
+        hints.append(paper.doi)
+    hints.extend(paper.urls)
+
+    for source_meta in paper.source_records:
+        for key in ("pdf_url", "landing_page_url", "source_id"):
+            raw = source_meta.get(key)
+            if isinstance(raw, str) and raw.strip():
+                hints.append(raw.strip())
+
+    for hint in hints:
+        lowered = hint.lower()
+        if lowered.endswith(".pdf"):
+            candidates = _merge_string_lists(candidates, [hint])
+
+        arxiv_id = _extract_arxiv_id(hint)
+        if arxiv_id:
+            candidates = _merge_string_lists(candidates, [f"https://arxiv.org/pdf/{arxiv_id}.pdf"])
+
+    return candidates
+
+
+def _lookup_openalex_pdf_candidates_for_doi(
+    *,
+    client: HttpClient,
+    config: LedgerConfig,
+    doi: str,
+) -> list[str]:
+    clean_doi = _clean_text(doi).strip()
+    if not clean_doi:
+        return []
+
+    filter_expr = f"doi:https://doi.org/{clean_doi}"
+    encoded = urllib.parse.quote(filter_expr)
+    url = f"{config.openalex_works_api}?filter={encoded}&per-page=1"
+    payload, error = client.fetch_json(url, headers={"Accept": "application/json"}, prefer="requests")
+    if error or not isinstance(payload, dict):
+        return []
+
+    rows = payload.get("results")
+    if not isinstance(rows, list) or not rows:
+        return []
+
+    work = rows[0]
+    if not isinstance(work, dict):
+        return []
+    return _openalex_work_pdf_candidates(work)
+
+
+def _openalex_work_pdf_candidates(work: dict) -> list[str]:
+    candidates: list[str] = []
+    best_oa = work.get("best_oa_location") if isinstance(work.get("best_oa_location"), dict) else {}
+    primary = work.get("primary_location") if isinstance(work.get("primary_location"), dict) else {}
+
+    for candidate in [
+        best_oa.get("pdf_url"),
+        best_oa.get("landing_page_url"),
+        primary.get("pdf_url"),
+        primary.get("landing_page_url"),
+    ]:
+        if not isinstance(candidate, str):
+            continue
+        value = _clean_text(candidate).strip()
+        if not value:
+            continue
+        if value.lower().endswith(".pdf") or "/pdf" in value.lower():
+            candidates = _merge_string_lists(candidates, [value])
+        arxiv_id = _extract_arxiv_id(value)
+        if arxiv_id:
+            candidates = _merge_string_lists(candidates, [f"https://arxiv.org/pdf/{arxiv_id}.pdf"])
+
+    return candidates
+
+
+def _scan_awards_from_documents(
+    *,
+    papers: list[CanonicalPaper],
+    client: HttpClient,
+    run_dir: Path,
+    award_regexes,
+    max_pdf_mb: int,
+    max_pages: int,
+    max_candidates_per_paper: int,
+    status: _LiveStatus | None = None,
+) -> dict[str, int]:
+    temp_pdf_dir = run_dir / "_pdf_cache"
+    temp_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    total = len(papers)
+    stage_started = time.monotonic()
+    mention_count = 0
+    no_pdf_count = 0
+    download_fail_count = 0
+    extract_fail_count = 0
+
+    for idx, paper in enumerate(papers, start=1):
+        if not paper.pdf_urls:
+            paper.document_scan_error = "No PDF candidates"
+            no_pdf_count += 1
+            if status:
+                status.update(
+                    (
+                        f"[paper-scan] {_progress_bar(idx, total)} {idx}/{total} "
+                        f"| mentions {mention_count} | no_pdf {no_pdf_count} "
+                        f"| dl_fail {download_fail_count} | extract_fail {extract_fail_count} "
+                        f"| elapsed {_format_elapsed(time.monotonic() - stage_started)}"
+                    ),
+                    force=(idx == total),
+                    min_interval=0.1,
+                )
+            continue
+
+        stem = safe_file_stem(f"{paper.canonical_id}-{idx}")
+        last_error: str | None = None
+        downloaded_any = False
+        extracted_any = False
+
+        for candidate_idx, pdf_url in enumerate(paper.pdf_urls[:max_candidates_per_paper], start=1):
+            destination = temp_pdf_dir / f"{stem}-{candidate_idx}.pdf"
+            ok, error = download_pdf(client, pdf_url, destination, max_pdf_mb=max_pdf_mb)
+            if not ok:
+                last_error = error or "PDF download failed"
+                continue
+
+            downloaded_any = True
+            paper.document_pdf_url = pdf_url
+            text, extract_error = extract_text_from_pdf(destination, max_pages=max_pages)
+            if extract_error or not text:
+                last_error = extract_error or "No extractable PDF text"
+                continue
+
+            extracted_any = True
+            mentions = find_award_mentions(text, award_regexes)
+            if mentions:
+                paper.award_mentioned_in_document = True
+                paper.document_award_mentions = mentions
+                paper.document_award_context = find_award_context(text, mentions)
+                paper.award_mentions = _merge_string_lists(paper.award_mentions, mentions)
+                paper.award_mentioned_in_metadata = True
+            break
+
+        if not downloaded_any and last_error:
+            paper.document_scan_error = last_error
+            download_fail_count += 1
+        elif downloaded_any and not extracted_any and last_error:
+            paper.document_scan_error = last_error
+            extract_fail_count += 1
+        elif extracted_any and not paper.award_mentioned_in_document:
+            paper.document_scan_error = None
+
+        if paper.award_mentioned_in_document:
+            mention_count += 1
+
+        if status:
+            status.update(
+                (
+                    f"[paper-scan] {_progress_bar(idx, total)} {idx}/{total} "
+                    f"| mentions {mention_count} | no_pdf {no_pdf_count} "
+                    f"| dl_fail {download_fail_count} | extract_fail {extract_fail_count} "
+                    f"| elapsed {_format_elapsed(time.monotonic() - stage_started)}"
+                ),
+                force=(idx == total),
+                min_interval=0.1,
+            )
+
+    return {
+        "papers_total": total,
+        "mentions_count": mention_count,
+        "no_pdf_count": no_pdf_count,
+        "download_fail_count": download_fail_count,
+        "extract_fail_count": extract_fail_count,
+    }
+
+
 def _canonical_id(record: SourcePaperRecord) -> str:
     if record.doi:
         return f"doi:{record.doi.lower()}"
@@ -425,9 +712,13 @@ def _canonical_id(record: SourcePaperRecord) -> str:
 
 
 def _extract_arxiv_id(value: str) -> str | None:
-    match = re.search(r"([0-9]{4}\.[0-9]{4,5})(?:v\d+)?", value)
+    match = re.search(r"([0-9]{4}\.[0-9]{4,5})(?:v\d+)?", value, flags=re.IGNORECASE)
     if match:
         return match.group(1)
+
+    hyphenated = re.search(r"abs[-_/]([0-9]{4})[-_/]([0-9]{4,5})(?:v\d+)?", value, flags=re.IGNORECASE)
+    if hyphenated:
+        return f"{hyphenated.group(1)}.{hyphenated.group(2)}"
     return None
 
 
@@ -486,7 +777,7 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
     lines.append(f"- Lookback years: {summary.lookback_years}")
     lines.append(f"- Raw source records: {summary.raw_record_count}")
     lines.append(f"- Canonical papers: {summary.canonical_paper_count}")
-    lines.append(f"- Metadata award mentions: {summary.award_match_count}")
+    lines.append(f"- Award mentions (metadata + document scan): {summary.award_match_count}")
     lines.append(f"- Proxy attempts: {summary.proxy_attempt_count}")
     lines.append(f"- Direct attempts: {summary.direct_attempt_count}")
     lines.append("")
@@ -497,7 +788,7 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
         lines.append(f"- {source}: {count} records ({errors} errors) | probe: {probe}")
 
     lines.append("")
-    lines.append("## Papers With Award Mention (Metadata)")
+    lines.append("## Papers With Award Mention")
     if not papers_with_award:
         lines.append("- None")
     else:
@@ -585,6 +876,24 @@ def _write_json(path: Path, payload) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def _progress_bar(completed: int, total: int, *, width: int = 18) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    bounded = max(0, min(completed, total))
+    filled = int(round((bounded / total) * width))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - (minutes * 60)
+    return f"{minutes}m{rem:04.1f}s"
 
 
 def _utc_now() -> str:
