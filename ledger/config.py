@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 from urllib.parse import quote
 from dataclasses import dataclass, field
@@ -150,6 +151,58 @@ def _parse_list_env(name: str, default: list[str]) -> list[str]:
     return values or list(default)
 
 
+def _parse_doi_list(raw_value: str | None) -> list[str]:
+    raw = _clean_optional(raw_value)
+    if not raw:
+        return []
+    # Accept comma/newline/space separated DOI-like tokens.
+    parts = re.split(r"[\s,]+", raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        value = part.strip().strip("()[]{}<>.,;")
+        if not value:
+            continue
+        if "10." not in value:
+            continue
+        idx = value.lower().find("10.")
+        value = value[idx:]
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _load_target_dois(env_file: Path) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add_many(values: list[str]) -> None:
+        for value in values:
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(value)
+
+    add_many(_parse_doi_list(os.getenv("LEDGER_TARGET_DOIS")))
+
+    raw_file = _clean_optional(os.getenv("LEDGER_TARGET_DOI_FILE"))
+    if raw_file:
+        file_path = Path(raw_file).expanduser()
+        if not file_path.is_absolute():
+            file_path = (env_file.parent / file_path).resolve()
+        try:
+            text = file_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        add_many(_parse_doi_list(text))
+
+    return merged
+
+
 @dataclass(slots=True)
 class ProxySettings:
     http: str | None = None
@@ -165,7 +218,13 @@ class SourceSettings:
     semantic_scholar: bool = True
     crossref: bool = True
     arxiv: bool = True
+    inspirehep: bool = True
     google_scholar: bool = True
+    datacite: bool = True
+    europe_pmc: bool = True
+    pubmed: bool = True
+    openaire: bool = True
+    doaj: bool = True
 
     def enabled_names(self) -> list[str]:
         out: list[str] = []
@@ -179,8 +238,20 @@ class SourceSettings:
             out.append("crossref")
         if self.arxiv:
             out.append("arxiv")
+        if self.inspirehep:
+            out.append("inspirehep")
         if self.google_scholar:
             out.append("google_scholar")
+        if self.datacite:
+            out.append("datacite")
+        if self.europe_pmc:
+            out.append("europe_pmc")
+        if self.pubmed:
+            out.append("pubmed")
+        if self.openaire:
+            out.append("openaire")
+        if self.doaj:
+            out.append("doaj")
         return out
 
 
@@ -197,15 +268,22 @@ class LedgerConfig:
     workers: int = 2
     max_results_per_member_per_source: int = 300
     max_google_scholar_pages: int = 2
+    max_openaire_pages: int = 2
+    max_doaj_pages: int = 2
     scan_pdfs_for_awards: bool = True
     pdf_scan_max_mb: int = 30
     pdf_scan_max_pages: int = 120
     pdf_scan_max_candidates_per_paper: int = 3
+    convert_award_pdfs_to_pdfa: bool = True
+    ghostscript_bin: str = "gs"
+    pdfa_fallback_copy: bool = False
     include_raw_payloads: bool = False
     probe_sources_before_collection: bool = True
     fallback_member_names: list[str] = field(default_factory=lambda: list(DEFAULT_AIMI_MEMBER_NAMES))
 
     award_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_AWARD_PATTERNS))
+    target_dois: list[str] = field(default_factory=list)
+    fail_on_missing_target_dois: bool = False
 
     semantic_scholar_api_key: str | None = None
     crossref_mailto: str | None = None
@@ -223,8 +301,20 @@ class LedgerConfig:
 
     crossref_works_api: str = "https://api.crossref.org/works"
     arxiv_api: str = "http://export.arxiv.org/api/query"
+    inspirehep_literature_api: str = "https://inspirehep.net/api/literature"
+    inspirehep_affiliation_id: str = "1862936"
+    inspirehep_page_size: int = 100
+    inspirehep_max_records: int = 1200
     google_scholar_search_url: str = "https://scholar.google.com/scholar"
     google_scholar_serpapi_api: str = "https://serpapi.com/search.json"
+    datacite_works_api: str = "https://api.datacite.org/dois"
+    europe_pmc_search_api: str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+    pubmed_esearch_api: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    pubmed_efetch_api: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    pubmed_tool: str = "ledger"
+    pubmed_email: str | None = None
+    openaire_publications_api: str = "https://api.openaire.eu/search/publications"
+    doaj_articles_api: str = "https://doaj.org/api/search/articles"
 
     sources: SourceSettings = field(default_factory=SourceSettings)
     proxy: ProxySettings = field(default_factory=ProxySettings)
@@ -273,7 +363,13 @@ class LedgerConfig:
             semantic_scholar=_get_bool("LEDGER_ENABLE_SEMANTIC_SCHOLAR", True),
             crossref=_get_bool("LEDGER_ENABLE_CROSSREF", True),
             arxiv=_get_bool("LEDGER_ENABLE_ARXIV", True),
+            inspirehep=_get_bool("LEDGER_ENABLE_INSPIREHEP", True),
             google_scholar=_get_bool("LEDGER_ENABLE_GOOGLE_SCHOLAR", True),
+            datacite=_get_bool("LEDGER_ENABLE_DATACITE", True),
+            europe_pmc=_get_bool("LEDGER_ENABLE_EUROPE_PMC", True),
+            pubmed=_get_bool("LEDGER_ENABLE_PUBMED", True),
+            openaire=_get_bool("LEDGER_ENABLE_OPENAIRE", True),
+            doaj=_get_bool("LEDGER_ENABLE_DOAJ", True),
         )
 
         config = cls(
@@ -287,14 +383,21 @@ class LedgerConfig:
             workers=max(1, _get_int("LEDGER_WORKERS", 2)),
             max_results_per_member_per_source=max(10, _get_int("LEDGER_MAX_RESULTS_PER_MEMBER_PER_SOURCE", 300)),
             max_google_scholar_pages=max(1, _get_int("LEDGER_MAX_GOOGLE_SCHOLAR_PAGES", 2)),
+            max_openaire_pages=max(1, _get_int("LEDGER_MAX_OPENAIRE_PAGES", 2)),
+            max_doaj_pages=max(1, _get_int("LEDGER_MAX_DOAJ_PAGES", 2)),
             scan_pdfs_for_awards=_get_bool("LEDGER_SCAN_PDFS_FOR_AWARDS", True),
             pdf_scan_max_mb=max(1, _get_int("LEDGER_PDF_SCAN_MAX_MB", 30)),
             pdf_scan_max_pages=max(1, _get_int("LEDGER_PDF_SCAN_MAX_PAGES", 120)),
             pdf_scan_max_candidates_per_paper=max(1, _get_int("LEDGER_PDF_SCAN_MAX_CANDIDATES_PER_PAPER", 3)),
+            convert_award_pdfs_to_pdfa=_get_bool("LEDGER_CONVERT_AWARD_PDFS_TO_PDFA", True),
+            ghostscript_bin=_clean_optional(os.getenv("LEDGER_GHOSTSCRIPT_BIN")) or defaults.ghostscript_bin,
+            pdfa_fallback_copy=_get_bool("LEDGER_PDFA_FALLBACK_COPY", False),
             include_raw_payloads=_get_bool("LEDGER_INCLUDE_RAW_PAYLOADS", False),
             probe_sources_before_collection=_get_bool("LEDGER_PROBE_SOURCES_BEFORE_COLLECTION", True),
             fallback_member_names=_parse_list_env("LEDGER_MEMBER_NAMES", DEFAULT_AIMI_MEMBER_NAMES),
             award_patterns=_parse_list_env("LEDGER_AWARD_PATTERNS", DEFAULT_AWARD_PATTERNS),
+            target_dois=_load_target_dois(env_file),
+            fail_on_missing_target_dois=_get_bool("LEDGER_FAIL_ON_MISSING_TARGET_DOIS", False),
             semantic_scholar_api_key=_clean_optional(os.getenv("LEDGER_SEMANTIC_SCHOLAR_API_KEY")),
             crossref_mailto=_clean_optional(os.getenv("LEDGER_CROSSREF_MAILTO")),
             serpapi_api_key=_clean_optional(os.getenv("LEDGER_SERPAPI_API_KEY")),
@@ -313,8 +416,26 @@ class LedgerConfig:
             ),
             crossref_works_api=os.getenv("LEDGER_CROSSREF_WORKS_API", defaults.crossref_works_api),
             arxiv_api=_normalize_arxiv_api_url(os.getenv("LEDGER_ARXIV_API"), defaults.arxiv_api),
+            inspirehep_literature_api=os.getenv(
+                "LEDGER_INSPIREHEP_LITERATURE_API",
+                defaults.inspirehep_literature_api,
+            ),
+            inspirehep_affiliation_id=(
+                _clean_optional(os.getenv("LEDGER_INSPIREHEP_AFFILIATION_ID"))
+                or defaults.inspirehep_affiliation_id
+            ),
+            inspirehep_page_size=max(1, _get_int("LEDGER_INSPIREHEP_PAGE_SIZE", defaults.inspirehep_page_size)),
+            inspirehep_max_records=max(1, _get_int("LEDGER_INSPIREHEP_MAX_RECORDS", defaults.inspirehep_max_records)),
             google_scholar_search_url=os.getenv("LEDGER_GOOGLE_SCHOLAR_SEARCH_URL", defaults.google_scholar_search_url),
             google_scholar_serpapi_api=os.getenv("LEDGER_GOOGLE_SCHOLAR_SERPAPI_API", defaults.google_scholar_serpapi_api),
+            datacite_works_api=os.getenv("LEDGER_DATACITE_WORKS_API", defaults.datacite_works_api),
+            europe_pmc_search_api=os.getenv("LEDGER_EUROPE_PMC_SEARCH_API", defaults.europe_pmc_search_api),
+            pubmed_esearch_api=os.getenv("LEDGER_PUBMED_ESEARCH_API", defaults.pubmed_esearch_api),
+            pubmed_efetch_api=os.getenv("LEDGER_PUBMED_EFETCH_API", defaults.pubmed_efetch_api),
+            pubmed_tool=os.getenv("LEDGER_PUBMED_TOOL", defaults.pubmed_tool),
+            pubmed_email=_clean_optional(os.getenv("LEDGER_PUBMED_EMAIL")),
+            openaire_publications_api=os.getenv("LEDGER_OPENAIRE_PUBLICATIONS_API", defaults.openaire_publications_api),
+            doaj_articles_api=os.getenv("LEDGER_DOAJ_ARTICLES_API", defaults.doaj_articles_api),
             sources=sources,
             proxy=proxy,
         )

@@ -106,6 +106,9 @@ class CanonicalPaper:
     document_award_mentions: list[str] = field(default_factory=list)
     document_award_context: str | None = None
     document_pdf_url: str | None = None
+    document_pdf_local_path: str | None = None
+    document_pdfa_path: str | None = None
+    document_pdfa_error: str | None = None
     document_scan_error: str | None = None
 
 
@@ -122,6 +125,16 @@ class CollectionRunSummary:
     raw_record_count: int
     canonical_paper_count: int
     award_match_count: int
+    document_scan_enabled: bool
+    document_scan_mentions_count: int
+    document_scan_no_pdf_count: int
+    document_scan_download_fail_count: int
+    document_scan_extract_fail_count: int
+    document_scan_pdfa_success_count: int
+    document_scan_pdfa_failure_count: int
+    target_doi_total: int
+    target_doi_matched: int
+    target_doi_missing: int
     proxy_attempt_count: int
     direct_attempt_count: int
 

@@ -13,16 +13,28 @@ from pathlib import Path
 from .collectors import (
     collect_arxiv_for_member,
     collect_crossref_for_member,
+    collect_datacite_for_member,
     collect_dblp_for_member,
+    collect_doaj_for_member,
+    collect_europe_pmc_for_member,
     collect_google_scholar_for_member,
+    collect_inspirehep_for_members,
     collect_openalex_for_member,
+    collect_openaire_for_member,
+    collect_pubmed_for_member,
     collect_semantic_scholar_for_member,
 )
 from .config import LedgerConfig
 from .funding import compile_award_regexes, find_award_context, find_award_mentions
 from .models import CanonicalPaper, CollectionRunSummary, Member, SourcePaperRecord, to_json_dict
 from .net import HttpClient
-from .pdfs import download_pdf, extract_text_from_pdf, safe_file_stem
+from .pdfs import (
+    convert_pdf_to_pdfa,
+    download_pdf,
+    ensure_pdfa_copy,
+    extract_text_from_pdf,
+    safe_file_stem,
+)
 from .team import parse_team_members
 
 logger = logging.getLogger(__name__)
@@ -32,7 +44,13 @@ SOURCE_ORDER = [
     "openalex",
     "semantic_scholar",
     "crossref",
+    "datacite",
+    "europe_pmc",
+    "pubmed",
+    "openaire",
+    "doaj",
     "arxiv",
+    "inspirehep",
     "google_scholar",
 ]
 
@@ -230,6 +248,15 @@ def run_ledger(
         enrich_stats["doi_lookup_count"],
     )
 
+    scan_stats = {
+        "papers_total": len(canonical_papers),
+        "mentions_count": 0,
+        "no_pdf_count": 0,
+        "download_fail_count": 0,
+        "extract_fail_count": 0,
+        "pdfa_success_count": 0,
+        "pdfa_failure_count": 0,
+    }
     if config.scan_pdfs_for_awards:
         scan_started = time.monotonic()
         scan_stats = _scan_awards_from_documents(
@@ -240,13 +267,17 @@ def run_ledger(
             max_pdf_mb=config.pdf_scan_max_mb,
             max_pages=config.pdf_scan_max_pages,
             max_candidates_per_paper=config.pdf_scan_max_candidates_per_paper,
+            workers=config.workers,
+            convert_to_pdfa=config.convert_award_pdfs_to_pdfa,
+            ghostscript_bin=config.ghostscript_bin,
+            pdfa_fallback_copy=config.pdfa_fallback_copy,
             status=status,
         )
         status.clear()
         logger.info(
             (
                 "Document award scan completed in %s "
-                "(papers=%d, mentions=%d, no_pdf=%d, download_fail=%d, extract_fail=%d)"
+                "(papers=%d, mentions=%d, no_pdf=%d, download_fail=%d, extract_fail=%d, pdfa_ok=%d, pdfa_fail=%d)"
             ),
             _format_elapsed(time.monotonic() - scan_started),
             scan_stats["papers_total"],
@@ -254,11 +285,15 @@ def run_ledger(
             scan_stats["no_pdf_count"],
             scan_stats["download_fail_count"],
             scan_stats["extract_fail_count"],
+            scan_stats["pdfa_success_count"],
+            scan_stats["pdfa_failure_count"],
         )
     canonical_papers.sort(key=lambda paper: ((paper.year or 0), paper.title.lower()), reverse=True)
 
     papers_with_award = [paper for paper in canonical_papers if paper.award_mentioned_in_metadata]
     papers_without_award = [paper for paper in canonical_papers if not paper.award_mentioned_in_metadata]
+    award_document_summary = _build_award_document_summary(canonical_papers)
+    target_coverage = _compute_target_doi_coverage(config.target_dois, canonical_papers)
 
     proxy_stats = client.proxy_stats()
 
@@ -275,6 +310,16 @@ def run_ledger(
         raw_record_count=len(all_records),
         canonical_paper_count=len(canonical_papers),
         award_match_count=len(papers_with_award),
+        document_scan_enabled=bool(config.scan_pdfs_for_awards),
+        document_scan_mentions_count=int(scan_stats["mentions_count"]),
+        document_scan_no_pdf_count=int(scan_stats["no_pdf_count"]),
+        document_scan_download_fail_count=int(scan_stats["download_fail_count"]),
+        document_scan_extract_fail_count=int(scan_stats["extract_fail_count"]),
+        document_scan_pdfa_success_count=int(scan_stats["pdfa_success_count"]),
+        document_scan_pdfa_failure_count=int(scan_stats["pdfa_failure_count"]),
+        target_doi_total=target_coverage["total"],
+        target_doi_matched=target_coverage["matched_count"],
+        target_doi_missing=target_coverage["missing_count"],
         proxy_attempt_count=int(proxy_stats.get("proxy_attempt_count", 0)),
         direct_attempt_count=int(proxy_stats.get("direct_attempt_count", 0)),
     )
@@ -287,6 +332,9 @@ def run_ledger(
     _write_json(run_dir / "summary.json", to_json_dict(summary))
     _write_json(run_dir / "source_errors.json", source_errors)
     _write_json(run_dir / "proxy_audit.json", proxy_stats)
+    _write_json(run_dir / "award_document_summary.json", award_document_summary)
+    if target_coverage["total"] > 0:
+        _write_json(run_dir / "target_doi_coverage.json", target_coverage)
     _write_json(run_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
     _write_json(
         run_dir / "papers_with_award_mention.json",
@@ -302,6 +350,9 @@ def run_ledger(
 
     # Convenience latest snapshots.
     _write_json(latest_dir / "summary.json", to_json_dict(summary))
+    _write_json(latest_dir / "award_document_summary.json", award_document_summary)
+    if target_coverage["total"] > 0:
+        _write_json(latest_dir / "target_doi_coverage.json", target_coverage)
     _write_json(latest_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
     _write_json(
         latest_dir / "papers_with_award_mention.json",
@@ -309,6 +360,16 @@ def run_ledger(
     )
 
     logger.info("Ledger pipeline finished in %s", _format_elapsed(time.monotonic() - run_clock_start))
+    if target_coverage["total"] > 0:
+        logger.info(
+            "Target DOI coverage: %d/%d matched (%d missing)",
+            target_coverage["matched_count"],
+            target_coverage["total"],
+            target_coverage["missing_count"],
+        )
+        if config.fail_on_missing_target_dois and target_coverage["missing_count"] > 0:
+            missing = ", ".join(target_coverage["missing"])
+            raise RuntimeError(f"Missing target DOI(s): {missing}")
 
     return summary
 
@@ -322,6 +383,17 @@ def _collect_source_for_members(
     min_year: int,
     status: _LiveStatus,
 ) -> tuple[list[SourcePaperRecord], list[dict[str, str]]]:
+    if source_name == "inspirehep":
+        status.update(f"[{source_name}] querying affiliation index...", force=True)
+        records, errors = collect_inspirehep_for_members(
+            members=members,
+            client=client,
+            config=config,
+            min_year=min_year,
+        )
+        status.clear()
+        return records, errors
+
     collector = _collector_for(source_name)
     workers = _workers_for_source(source_name, config.workers)
 
@@ -385,6 +457,11 @@ def _collector_for(source_name: str):
         "openalex": collect_openalex_for_member,
         "semantic_scholar": collect_semantic_scholar_for_member,
         "crossref": collect_crossref_for_member,
+        "datacite": collect_datacite_for_member,
+        "europe_pmc": collect_europe_pmc_for_member,
+        "pubmed": collect_pubmed_for_member,
+        "openaire": collect_openaire_for_member,
+        "doaj": collect_doaj_for_member,
         "arxiv": collect_arxiv_for_member,
         "google_scholar": collect_google_scholar_for_member,
     }
@@ -394,7 +471,7 @@ def _collector_for(source_name: str):
 
 
 def _workers_for_source(source_name: str, default_workers: int) -> int:
-    if source_name in {"dblp", "google_scholar"}:
+    if source_name in {"dblp", "google_scholar", "pubmed"}:
         return 1
     if source_name == "arxiv":
         return max(1, min(default_workers, 2))
@@ -607,87 +684,91 @@ def _scan_awards_from_documents(
     max_pdf_mb: int,
     max_pages: int,
     max_candidates_per_paper: int,
+    workers: int,
+    convert_to_pdfa: bool,
+    ghostscript_bin: str,
+    pdfa_fallback_copy: bool,
     status: _LiveStatus | None = None,
 ) -> dict[str, int]:
     temp_pdf_dir = run_dir / "_pdf_cache"
     temp_pdf_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(papers)
+    if total == 0:
+        return {
+            "papers_total": 0,
+            "mentions_count": 0,
+            "no_pdf_count": 0,
+            "download_fail_count": 0,
+            "extract_fail_count": 0,
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+
     stage_started = time.monotonic()
     mention_count = 0
     no_pdf_count = 0
     download_fail_count = 0
     extract_fail_count = 0
+    pdfa_success_count = 0
+    pdfa_failure_count = 0
+    completed = 0
+    scan_workers = max(1, workers)
+    with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+        futures = {
+            pool.submit(
+                _scan_single_paper_for_award,
+                idx=idx,
+                paper=paper,
+                client=client,
+                temp_pdf_dir=temp_pdf_dir,
+                award_regexes=award_regexes,
+                max_pdf_mb=max_pdf_mb,
+                max_pages=max_pages,
+                max_candidates_per_paper=max_candidates_per_paper,
+                convert_to_pdfa=convert_to_pdfa,
+                ghostscript_bin=ghostscript_bin,
+                pdfa_fallback_copy=pdfa_fallback_copy,
+            ): idx
+            for idx, paper in enumerate(papers, start=1)
+        }
 
-    for idx, paper in enumerate(papers, start=1):
-        if not paper.pdf_urls:
-            paper.document_scan_error = "No PDF candidates"
-            no_pdf_count += 1
+        for future in as_completed(futures):
+            completed += 1
+            idx = futures[future]
+            try:
+                stats = future.result()
+            except Exception as exc:  # pragma: no cover - safety net for parser/network edge cases.
+                paper = papers[idx - 1]
+                paper.document_scan_error = f"Document scan failed: {exc}"
+                stats = {
+                    "mentions_count": 0,
+                    "no_pdf_count": 0,
+                    "download_fail_count": 1,
+                    "extract_fail_count": 0,
+                    "pdfa_success_count": 0,
+                    "pdfa_failure_count": 0,
+                }
+
+            mention_count += int(stats["mentions_count"])
+            no_pdf_count += int(stats["no_pdf_count"])
+            download_fail_count += int(stats["download_fail_count"])
+            extract_fail_count += int(stats["extract_fail_count"])
+            pdfa_success_count += int(stats["pdfa_success_count"])
+            pdfa_failure_count += int(stats["pdfa_failure_count"])
+
             if status:
                 status.update(
                     (
-                        f"[paper-scan] {_progress_bar(idx, total)} {idx}/{total} "
+                        f"[paper-scan] {_progress_bar(completed, total)} {completed}/{total} "
                         f"| mentions {mention_count} | no_pdf {no_pdf_count} "
                         f"| dl_fail {download_fail_count} | extract_fail {extract_fail_count} "
+                        f"| pdfa_ok {pdfa_success_count} | pdfa_fail {pdfa_failure_count} "
                         f"| elapsed {_format_elapsed(time.monotonic() - stage_started)}"
                     ),
-                    force=(idx == total),
+                    force=(completed == total),
                     min_interval=0.1,
                 )
-            continue
-
-        stem = safe_file_stem(f"{paper.canonical_id}-{idx}")
-        last_error: str | None = None
-        downloaded_any = False
-        extracted_any = False
-
-        for candidate_idx, pdf_url in enumerate(paper.pdf_urls[:max_candidates_per_paper], start=1):
-            destination = temp_pdf_dir / f"{stem}-{candidate_idx}.pdf"
-            ok, error = download_pdf(client, pdf_url, destination, max_pdf_mb=max_pdf_mb)
-            if not ok:
-                last_error = error or "PDF download failed"
-                continue
-
-            downloaded_any = True
-            paper.document_pdf_url = pdf_url
-            text, extract_error = extract_text_from_pdf(destination, max_pages=max_pages)
-            if extract_error or not text:
-                last_error = extract_error or "No extractable PDF text"
-                continue
-
-            extracted_any = True
-            mentions = find_award_mentions(text, award_regexes)
-            if mentions:
-                paper.award_mentioned_in_document = True
-                paper.document_award_mentions = mentions
-                paper.document_award_context = find_award_context(text, mentions)
-                paper.award_mentions = _merge_string_lists(paper.award_mentions, mentions)
-                paper.award_mentioned_in_metadata = True
-            break
-
-        if not downloaded_any and last_error:
-            paper.document_scan_error = last_error
-            download_fail_count += 1
-        elif downloaded_any and not extracted_any and last_error:
-            paper.document_scan_error = last_error
-            extract_fail_count += 1
-        elif extracted_any and not paper.award_mentioned_in_document:
-            paper.document_scan_error = None
-
-        if paper.award_mentioned_in_document:
-            mention_count += 1
-
-        if status:
-            status.update(
-                (
-                    f"[paper-scan] {_progress_bar(idx, total)} {idx}/{total} "
-                    f"| mentions {mention_count} | no_pdf {no_pdf_count} "
-                    f"| dl_fail {download_fail_count} | extract_fail {extract_fail_count} "
-                    f"| elapsed {_format_elapsed(time.monotonic() - stage_started)}"
-                ),
-                force=(idx == total),
-                min_interval=0.1,
-            )
 
     return {
         "papers_total": total,
@@ -695,6 +776,120 @@ def _scan_awards_from_documents(
         "no_pdf_count": no_pdf_count,
         "download_fail_count": download_fail_count,
         "extract_fail_count": extract_fail_count,
+        "pdfa_success_count": pdfa_success_count,
+        "pdfa_failure_count": pdfa_failure_count,
+    }
+
+
+def _scan_single_paper_for_award(
+    *,
+    idx: int,
+    paper: CanonicalPaper,
+    client: HttpClient,
+    temp_pdf_dir: Path,
+    award_regexes,
+    max_pdf_mb: int,
+    max_pages: int,
+    max_candidates_per_paper: int,
+    convert_to_pdfa: bool,
+    ghostscript_bin: str,
+    pdfa_fallback_copy: bool,
+) -> dict[str, int]:
+    if not paper.pdf_urls:
+        paper.document_scan_error = "No PDF candidates"
+        return {
+            "mentions_count": 0,
+            "no_pdf_count": 1,
+            "download_fail_count": 0,
+            "extract_fail_count": 0,
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+
+    stem = safe_file_stem(f"{paper.canonical_id}-{idx}")
+    last_error: str | None = None
+    downloaded_any = False
+    extracted_any = False
+    pdfa_success_count = 0
+    pdfa_failure_count = 0
+
+    for candidate_idx, pdf_url in enumerate(paper.pdf_urls[:max_candidates_per_paper], start=1):
+        destination = temp_pdf_dir / f"{stem}-{candidate_idx}.pdf"
+        ok, error = download_pdf(client, pdf_url, destination, max_pdf_mb=max_pdf_mb)
+        if not ok:
+            last_error = error or "PDF download failed"
+            continue
+
+        downloaded_any = True
+        paper.document_pdf_url = pdf_url
+        paper.document_pdf_local_path = str(destination)
+        text, extract_error = extract_text_from_pdf(destination, max_pages=max_pages)
+        if extract_error or not text:
+            last_error = extract_error or "No extractable PDF text"
+            continue
+
+        extracted_any = True
+        mentions = find_award_mentions(text, award_regexes)
+        if mentions:
+            paper.award_mentioned_in_document = True
+            paper.document_award_mentions = mentions
+            paper.document_award_context = find_award_context(text, mentions)
+            paper.award_mentions = _merge_string_lists(paper.award_mentions, mentions)
+            paper.award_mentioned_in_metadata = True
+            if convert_to_pdfa:
+                pdfa_dir = temp_pdf_dir.parent / "pdfa"
+                pdfa_path = pdfa_dir / f"{stem}-{candidate_idx}.pdf"
+                ok_pdfa, pdfa_error = convert_pdf_to_pdfa(
+                    destination,
+                    pdfa_path,
+                    ghostscript_bin=ghostscript_bin,
+                )
+                if ok_pdfa:
+                    paper.document_pdfa_path = str(pdfa_path)
+                    paper.document_pdfa_error = None
+                    pdfa_success_count += 1
+                else:
+                    if pdfa_fallback_copy:
+                        ensure_pdfa_copy(destination, pdfa_path)
+                        paper.document_pdfa_path = str(pdfa_path)
+                        paper.document_pdfa_error = (
+                            f"PDF/A conversion failed, copied original PDF instead: {pdfa_error}"
+                        )
+                    else:
+                        paper.document_pdfa_error = pdfa_error or "PDF/A conversion failed"
+                    pdfa_failure_count += 1
+        break
+
+    if not downloaded_any and last_error:
+        paper.document_scan_error = last_error
+        return {
+            "mentions_count": 0,
+            "no_pdf_count": 0,
+            "download_fail_count": 1,
+            "extract_fail_count": 0,
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+    if downloaded_any and not extracted_any and last_error:
+        paper.document_scan_error = last_error
+        return {
+            "mentions_count": 0,
+            "no_pdf_count": 0,
+            "download_fail_count": 0,
+            "extract_fail_count": 1,
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+    if extracted_any and not paper.award_mentioned_in_document:
+        paper.document_scan_error = None
+
+    return {
+        "mentions_count": 1 if paper.award_mentioned_in_document else 0,
+        "no_pdf_count": 0,
+        "download_fail_count": 0,
+        "extract_fail_count": 0,
+        "pdfa_success_count": pdfa_success_count,
+        "pdfa_failure_count": pdfa_failure_count,
     }
 
 
@@ -766,6 +961,33 @@ def _merge_string_lists(left: list[str], right: list[str]) -> list[str]:
     return out
 
 
+def _build_award_document_summary(papers: list[CanonicalPaper]) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for paper in papers:
+        if not paper.award_mentioned_in_document:
+            continue
+        out.append(
+            {
+                "canonical_id": paper.canonical_id,
+                "title": paper.title,
+                "year": paper.year,
+                "venue": paper.venue,
+                "doi": paper.doi,
+                "aimi_members": paper.aimi_members,
+                "sources": paper.sources,
+                "award_mentions": paper.document_award_mentions,
+                "award_context": paper.document_award_context,
+                "document_pdf_url": paper.document_pdf_url,
+                "document_pdf_local_path": paper.document_pdf_local_path,
+                "document_pdfa_path": paper.document_pdfa_path,
+                "pdfa_conversion_ok": bool(paper.document_pdfa_path and not paper.document_pdfa_error),
+                "document_pdfa_error": paper.document_pdfa_error,
+                "document_scan_error": paper.document_scan_error,
+            }
+        )
+    return out
+
+
 def _render_report(summary: CollectionRunSummary, papers_with_award: list[CanonicalPaper]) -> str:
     lines: list[str] = []
     lines.append("# Ledger Collection Report")
@@ -778,6 +1000,21 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
     lines.append(f"- Raw source records: {summary.raw_record_count}")
     lines.append(f"- Canonical papers: {summary.canonical_paper_count}")
     lines.append(f"- Award mentions (metadata + document scan): {summary.award_match_count}")
+    lines.append(
+        "- Document scan: "
+        f"{'enabled' if summary.document_scan_enabled else 'disabled'} "
+        f"(mentions={summary.document_scan_mentions_count}, "
+        f"no_pdf={summary.document_scan_no_pdf_count}, "
+        f"download_fail={summary.document_scan_download_fail_count}, "
+        f"extract_fail={summary.document_scan_extract_fail_count}, "
+        f"pdfa_ok={summary.document_scan_pdfa_success_count}, "
+        f"pdfa_fail={summary.document_scan_pdfa_failure_count})"
+    )
+    if summary.target_doi_total > 0:
+        lines.append(
+            f"- Target DOI coverage: {summary.target_doi_matched}/{summary.target_doi_total} "
+            f"(missing: {summary.target_doi_missing})"
+        )
     lines.append(f"- Proxy attempts: {summary.proxy_attempt_count}")
     lines.append(f"- Direct attempts: {summary.direct_attempt_count}")
     lines.append("")
@@ -842,10 +1079,36 @@ def _source_probe_url(source_name: str, *, config: LedgerConfig, min_year: int) 
         )
     if source_name == "crossref":
         return f"{config.crossref_works_api}?query.author=Kilian+Weinberger&rows=1"
+    if source_name == "datacite":
+        return (
+            f"{config.datacite_works_api}"
+            "?query=creators.name%3A%22Kilian+Weinberger%22&page%5Bsize%5D=1&page%5Bnumber%5D=1"
+        )
+    if source_name == "europe_pmc":
+        return (
+            f"{config.europe_pmc_search_api}"
+            "?query=AUTH%3A%22Kilian+Weinberger%22&format=json&pageSize=1&page=1"
+        )
+    if source_name == "pubmed":
+        return (
+            f"{config.pubmed_esearch_api}"
+            "?db=pubmed&retmode=json&retmax=1&term=Kilian+Weinberger%5BAuthor%5D"
+        )
+    if source_name == "openaire":
+        return f"{config.openaire_publications_api}?keywords=materials&size=1&page=1"
+    if source_name == "doaj":
+        return f"{config.doaj_articles_api}/materials?page=1&pageSize=1"
     if source_name == "arxiv":
         return (
             f"{config.arxiv_api}"
             "?search_query=all:materials&start=0&max_results=1&sortBy=submittedDate&sortOrder=descending"
+        )
+    if source_name == "inspirehep":
+        max_year = datetime.now(tz=timezone.utc).year
+        query = urllib.parse.quote(f"affid:{config.inspirehep_affiliation_id} and date {min_year}->{max_year}")
+        return (
+            f"{config.inspirehep_literature_api}"
+            f"?q={query}&size=1&sort=mostrecent"
         )
     if source_name == "google_scholar":
         if config.serpapi_api_key:
@@ -858,10 +1121,22 @@ def _source_probe_url(source_name: str, *, config: LedgerConfig, min_year: int) 
 
 
 def _source_probe_headers(source_name: str, *, config: LedgerConfig) -> dict[str, str]:
-    if source_name in {"dblp", "openalex", "semantic_scholar", "crossref"}:
+    if source_name in {
+        "dblp",
+        "openalex",
+        "semantic_scholar",
+        "crossref",
+        "inspirehep",
+        "datacite",
+        "europe_pmc",
+        "pubmed",
+        "doaj",
+    }:
         headers = {"Accept": "application/json"}
     elif source_name == "arxiv":
         headers = {"Accept": "application/atom+xml"}
+    elif source_name == "openaire":
+        headers = {"Accept": "application/xml,text/xml"}
     else:
         headers = {"Accept": "text/html"}
     if source_name == "google_scholar" and config.serpapi_api_key:
@@ -898,3 +1173,52 @@ def _format_elapsed(seconds: float) -> str:
 
 def _utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalPaper]) -> dict[str, object]:
+    dedup_targets: list[str] = []
+    seen: set[str] = set()
+    for value in target_dois:
+        cleaned = _clean_text(value).lower()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        dedup_targets.append(cleaned)
+
+    have_by_doi: dict[str, CanonicalPaper] = {}
+    for paper in papers:
+        if not paper.doi:
+            continue
+        doi = _clean_text(paper.doi).lower()
+        if doi and doi not in have_by_doi:
+            have_by_doi[doi] = paper
+
+    matched: list[str] = []
+    missing: list[str] = []
+    details: list[dict[str, object]] = []
+
+    for doi in dedup_targets:
+        paper = have_by_doi.get(doi)
+        if paper is None:
+            missing.append(doi)
+            details.append({"doi": doi, "found": False})
+            continue
+        matched.append(doi)
+        details.append(
+            {
+                "doi": doi,
+                "found": True,
+                "title": paper.title,
+                "aimi_members": paper.aimi_members,
+                "sources": paper.sources,
+            }
+        )
+
+    return {
+        "total": len(dedup_targets),
+        "matched_count": len(matched),
+        "missing_count": len(missing),
+        "matched": matched,
+        "missing": missing,
+        "details": details,
+    }

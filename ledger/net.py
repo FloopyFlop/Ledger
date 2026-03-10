@@ -535,6 +535,16 @@ class HttpClient:
             return 0.35
         if host.endswith("crossref.org"):
             return 0.25
+        if host.endswith("datacite.org"):
+            return 0.25
+        if host.endswith("ebi.ac.uk"):
+            return 0.25
+        if host.endswith("ncbi.nlm.nih.gov"):
+            return 0.34
+        if host.endswith("openaire.eu"):
+            return 0.25
+        if host.endswith("doaj.org"):
+            return 0.25
         if host.endswith("arxiv.org"):
             return 0.35
         if host.endswith("scholar.google.com"):
@@ -610,6 +620,11 @@ class HttpClient:
             "openalex.org",
             "api.semanticscholar.org",
             "api.crossref.org",
+            "api.datacite.org",
+            "www.ebi.ac.uk",
+            "eutils.ncbi.nlm.nih.gov",
+            "api.openaire.eu",
+            "doaj.org",
             "dblp.org",
             "export.arxiv.org",
             "scholar.google.com",

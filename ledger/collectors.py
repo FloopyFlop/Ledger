@@ -4,6 +4,7 @@ import hashlib
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Callable
 
 from bs4 import BeautifulSoup
@@ -323,6 +324,472 @@ def collect_crossref_for_member(
     return records, None
 
 
+def collect_datacite_for_member(
+    member: Member,
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], str | None]:
+    page_size = min(100, config.max_results_per_member_per_source)
+    page_number = 1
+    records: list[SourcePaperRecord] = []
+
+    while len(records) < config.max_results_per_member_per_source:
+        params = {
+            "query": f'creators.name:"{member.name}"',
+            "page[size]": str(page_size),
+            "page[number]": str(page_number),
+        }
+        url = f"{config.datacite_works_api}?{urllib.parse.urlencode(params)}"
+        payload, error = client.fetch_json(
+            url,
+            headers={"Accept": "application/vnd.api+json"},
+            prefer="requests",
+        )
+        if error:
+            if records:
+                return records, None
+            return [], error
+        if not isinstance(payload, dict):
+            break
+
+        rows = payload.get("data")
+        if not isinstance(rows, list) or not rows:
+            break
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+            title = _datacite_title(attrs)
+            if not title:
+                continue
+
+            published_date = _clean_optional(str(attrs.get("published", "")))
+            year = _safe_int(attrs.get("publicationYear")) or _year_from_text(published_date)
+            if year is not None and year < min_year:
+                continue
+
+            authors = _datacite_creators(attrs.get("creators"))
+            if authors and not any(_author_matches_member(member.name, author) for author in authors):
+                continue
+
+            doi = _normalize_doi(str(attrs.get("doi", "")))
+            source_id = doi or _clean_optional(str(row.get("id", ""))) or _stable_id("datacite", title, year)
+            landing_page = _clean_optional(str(attrs.get("url", "")))
+            if not landing_page and doi:
+                landing_page = f"https://doi.org/{doi}"
+
+            records.append(
+                SourcePaperRecord(
+                    source="datacite",
+                    source_id=source_id,
+                    member_name=member.name,
+                    title=title,
+                    year=year,
+                    published_date=published_date or _year_to_iso(year),
+                    venue=_clean_optional(str(attrs.get("publisher", ""))),
+                    doi=doi,
+                    authors=authors,
+                    abstract=_datacite_abstract(attrs),
+                    landing_page_url=landing_page,
+                    pdf_url=_datacite_pdf_url(attrs),
+                    relevance_score=0.82,
+                    raw=(row if config.include_raw_payloads else None),
+                )
+            )
+            if len(records) >= config.max_results_per_member_per_source:
+                return records, None
+
+        if len(rows) < page_size:
+            break
+        page_number += 1
+
+    return records, None
+
+
+def collect_europe_pmc_for_member(
+    member: Member,
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], str | None]:
+    page_size = min(100, config.max_results_per_member_per_source)
+    page = 1
+    records: list[SourcePaperRecord] = []
+
+    query = f'AUTH:"{member.name}" AND FIRST_PDATE:[{min_year}-01-01 TO 3000-12-31]'
+    while len(records) < config.max_results_per_member_per_source:
+        params = {
+            "query": query,
+            "format": "json",
+            "pageSize": str(page_size),
+            "page": str(page),
+        }
+        url = f"{config.europe_pmc_search_api}?{urllib.parse.urlencode(params)}"
+        payload, error = client.fetch_json(url, headers={"Accept": "application/json"}, prefer="requests")
+        if error:
+            if records:
+                return records, None
+            return [], error
+        if not isinstance(payload, dict):
+            break
+
+        result_list = payload.get("resultList") if isinstance(payload.get("resultList"), dict) else {}
+        rows = result_list.get("result") if isinstance(result_list, dict) else []
+        if not isinstance(rows, list) or not rows:
+            break
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = _clean_text(str(row.get("title", "")))
+            if not title:
+                continue
+
+            published_date = (
+                _clean_optional(str(row.get("firstPublicationDate", "")))
+                or _clean_optional(str(row.get("electronicPublicationDate", "")))
+            )
+            year = _safe_int(row.get("pubYear")) or _year_from_text(published_date)
+            if year is not None and year < min_year:
+                continue
+
+            authors = _europe_pmc_authors(row)
+            if authors and not any(_author_matches_member(member.name, author) for author in authors):
+                continue
+
+            doi = _normalize_doi(str(row.get("doi", "")))
+            pmid = _clean_optional(str(row.get("pmid", "")))
+            pmcid = _clean_optional(str(row.get("pmcid", "")))
+            source = _clean_optional(str(row.get("source", "")))
+            native_id = _clean_optional(str(row.get("id", "")))
+
+            landing_page = None
+            if doi:
+                landing_page = f"https://doi.org/{doi}"
+            elif pmcid:
+                landing_page = f"https://pmc.ncbi.nlm.nih.gov/articles/{_normalize_pmcid(pmcid)}/"
+            elif pmid:
+                landing_page = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            elif source and native_id:
+                landing_page = f"https://europepmc.org/article/{source}/{native_id}"
+
+            source_id = (
+                doi
+                or (f"pmid:{pmid}" if pmid else None)
+                or (f"pmcid:{pmcid}" if pmcid else None)
+                or (f"europepmc:{source}:{native_id}" if source and native_id else None)
+                or _stable_id("europe_pmc", title, year)
+            )
+
+            records.append(
+                SourcePaperRecord(
+                    source="europe_pmc",
+                    source_id=source_id,
+                    member_name=member.name,
+                    title=title,
+                    year=year,
+                    published_date=published_date or _year_to_iso(year),
+                    venue=_clean_optional(str(row.get("journalTitle", ""))) or "Europe PMC",
+                    doi=doi,
+                    authors=authors,
+                    abstract=_clean_optional(_clean_text(str(row.get("abstractText", "")))),
+                    landing_page_url=landing_page,
+                    pdf_url=_europe_pmc_pdf_url(row),
+                    relevance_score=0.8,
+                    raw=(row if config.include_raw_payloads else None),
+                )
+            )
+            if len(records) >= config.max_results_per_member_per_source:
+                return records, None
+
+        if len(rows) < page_size:
+            break
+        page += 1
+
+    return records, None
+
+
+def collect_pubmed_for_member(
+    member: Member,
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], str | None]:
+    retmax = min(100, config.max_results_per_member_per_source)
+    retstart = 0
+    records: list[SourcePaperRecord] = []
+
+    while len(records) < config.max_results_per_member_per_source:
+        search_params = {
+            "db": "pubmed",
+            "retmode": "json",
+            "retmax": str(retmax),
+            "retstart": str(retstart),
+            "sort": "pub date",
+            "term": _pubmed_author_query(member.name, min_year=min_year),
+            "tool": config.pubmed_tool,
+        }
+        if config.pubmed_email:
+            search_params["email"] = config.pubmed_email
+        search_url = f"{config.pubmed_esearch_api}?{urllib.parse.urlencode(search_params)}"
+        search_payload, search_error = client.fetch_json(
+            search_url,
+            headers={"Accept": "application/json"},
+            prefer="requests",
+        )
+        if search_error:
+            if records:
+                return records, None
+            return [], search_error
+        if not isinstance(search_payload, dict):
+            break
+
+        pmids = _pubmed_id_list(search_payload)
+        if not pmids:
+            break
+
+        fetch_params = {
+            "db": "pubmed",
+            "retmode": "xml",
+            "id": ",".join(pmids),
+            "tool": config.pubmed_tool,
+        }
+        if config.pubmed_email:
+            fetch_params["email"] = config.pubmed_email
+        fetch_url = f"{config.pubmed_efetch_api}?{urllib.parse.urlencode(fetch_params)}"
+        xml_text, fetch_error = client.fetch_text(
+            fetch_url,
+            headers={"Accept": "application/xml,text/xml"},
+            prefer="requests",
+        )
+        if fetch_error:
+            if records:
+                return records, None
+            return [], fetch_error
+        if not xml_text:
+            break
+
+        rows, parse_error = _parse_pubmed_fetch_xml(xml_text)
+        if parse_error:
+            if records:
+                return records, None
+            return [], parse_error
+        if not rows:
+            break
+
+        for row in rows:
+            title = row.get("title")
+            if not isinstance(title, str) or not title:
+                continue
+
+            year = _safe_int(row.get("year"))
+            if year is not None and year < min_year:
+                continue
+
+            authors = row.get("authors")
+            if not isinstance(authors, list):
+                authors = []
+            if authors and not any(_pubmed_author_matches_member(member.name, author) for author in authors):
+                continue
+
+            pmid = _clean_optional(str(row.get("pmid", "")))
+            if not pmid:
+                continue
+            doi = _normalize_doi(str(row.get("doi", "")))
+            pmcid = _normalize_pmcid(_clean_optional(str(row.get("pmcid", ""))))
+            landing_page = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            if doi:
+                landing_page = f"https://doi.org/{doi}"
+
+            records.append(
+                SourcePaperRecord(
+                    source="pubmed",
+                    source_id=(doi or f"pmid:{pmid}"),
+                    member_name=member.name,
+                    title=title,
+                    year=year,
+                    published_date=_clean_optional(str(row.get("published_date", ""))) or _year_to_iso(year),
+                    venue=_clean_optional(str(row.get("journal", ""))) or "PubMed",
+                    doi=doi,
+                    authors=authors,
+                    abstract=_clean_optional(str(row.get("abstract", ""))),
+                    landing_page_url=landing_page,
+                    pdf_url=(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/" if pmcid else None),
+                    relevance_score=0.83,
+                    raw=(row if config.include_raw_payloads else None),
+                )
+            )
+            if len(records) >= config.max_results_per_member_per_source:
+                return records, None
+
+        if len(pmids) < retmax:
+            break
+        retstart += retmax
+
+    return records, None
+
+
+def collect_openaire_for_member(
+    member: Member,
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], str | None]:
+    page_size = min(100, config.max_results_per_member_per_source)
+    page = 1
+    records: list[SourcePaperRecord] = []
+
+    while len(records) < config.max_results_per_member_per_source and page <= config.max_openaire_pages:
+        params = {
+            "keywords": f'"{member.name}"',
+            "size": str(page_size),
+            "page": str(page),
+        }
+        url = f"{config.openaire_publications_api}?{urllib.parse.urlencode(params)}"
+        xml_text, error = client.fetch_text(url, headers={"Accept": "application/xml,text/xml"}, prefer="requests")
+        if error or not xml_text:
+            if records:
+                return records, None
+            return [], error or "No OpenAIRE response"
+
+        rows, parse_error, total_pages = _parse_openaire_results(xml_text)
+        if parse_error:
+            if records:
+                return records, None
+            return [], parse_error
+        if not rows:
+            break
+
+        for row in rows:
+            title = _clean_optional(str(row.get("title", "")))
+            if not title:
+                continue
+
+            year = _safe_int(row.get("year")) or _year_from_text(_clean_optional(str(row.get("published_date", ""))))
+            if year is not None and year < min_year:
+                continue
+
+            authors = row.get("authors")
+            if not isinstance(authors, list):
+                authors = []
+            if authors and not any(_author_matches_member(member.name, author) for author in authors):
+                continue
+
+            doi = _normalize_doi(_clean_optional(str(row.get("doi", ""))))
+            urls = row.get("urls")
+            if not isinstance(urls, list):
+                urls = []
+            landing_page = urls[0] if urls else None
+            pdf_url = _pick_pdf_url(urls)
+            source_id = doi or _stable_id("openaire", title, year)
+
+            records.append(
+                SourcePaperRecord(
+                    source="openaire",
+                    source_id=source_id,
+                    member_name=member.name,
+                    title=title,
+                    year=year,
+                    published_date=_clean_optional(str(row.get("published_date", ""))) or _year_to_iso(year),
+                    venue=_clean_optional(str(row.get("venue", ""))) or "OpenAIRE",
+                    doi=doi,
+                    authors=authors,
+                    abstract=_clean_optional(str(row.get("abstract", ""))),
+                    landing_page_url=landing_page,
+                    pdf_url=pdf_url,
+                    relevance_score=0.78,
+                    raw=(row if config.include_raw_payloads else None),
+                )
+            )
+            if len(records) >= config.max_results_per_member_per_source:
+                return records, None
+
+        if len(rows) < page_size:
+            break
+        if total_pages is not None and page >= total_pages:
+            break
+        page += 1
+
+    return records, None
+
+
+def collect_doaj_for_member(
+    member: Member,
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], str | None]:
+    page_size = min(100, config.max_results_per_member_per_source)
+    page = 1
+    records: list[SourcePaperRecord] = []
+
+    while len(records) < config.max_results_per_member_per_source and page <= config.max_doaj_pages:
+        query = urllib.parse.quote(member.name)
+        url = f"{config.doaj_articles_api}/{query}?page={page}&pageSize={page_size}"
+        payload, error = client.fetch_json(url, headers={"Accept": "application/json"}, prefer="requests")
+        if error:
+            if records:
+                return records, None
+            return [], error
+        if not isinstance(payload, dict):
+            break
+
+        rows = payload.get("results")
+        if not isinstance(rows, list) or not rows:
+            break
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            bib = row.get("bibjson") if isinstance(row.get("bibjson"), dict) else {}
+            title = _clean_optional(str(bib.get("title", "")))
+            if not title:
+                continue
+
+            year = _safe_int(bib.get("year")) or _year_from_text(_clean_optional(str(bib.get("last_updated", ""))))
+            if year is not None and year < min_year:
+                continue
+
+            authors = _doaj_authors(bib.get("author"))
+            if authors and not any(_author_matches_member(member.name, author) for author in authors):
+                continue
+
+            doi = _doaj_doi(bib.get("identifier"))
+            links = _doaj_links(bib.get("link"))
+            source_id = doi or _clean_optional(str(row.get("id", ""))) or _stable_id("doaj", title, year)
+            venue = _doaj_journal_title(bib)
+            landing_page = links[0] if links else None
+
+            records.append(
+                SourcePaperRecord(
+                    source="doaj",
+                    source_id=source_id,
+                    member_name=member.name,
+                    title=title,
+                    year=year,
+                    published_date=_year_to_iso(year),
+                    venue=venue or "DOAJ",
+                    doi=doi,
+                    authors=authors,
+                    abstract=_clean_optional(str(bib.get("abstract", ""))),
+                    landing_page_url=landing_page,
+                    pdf_url=_pick_pdf_url(links),
+                    relevance_score=0.74,
+                    raw=(row if config.include_raw_payloads else None),
+                )
+            )
+            if len(records) >= config.max_results_per_member_per_source:
+                return records, None
+
+        if len(rows) < page_size:
+            break
+        page += 1
+
+    return records, None
+
+
 def collect_arxiv_for_member(
     member: Member,
     client: HttpClient,
@@ -332,9 +799,9 @@ def collect_arxiv_for_member(
     records: list[SourcePaperRecord] = []
     start = 0
     batch_size = min(100, config.max_results_per_member_per_source)
+    query = _arxiv_author_query(member.name)
 
     while start < config.max_results_per_member_per_source:
-        query = f'au:"{member.name}"'
         params = {
             "search_query": query,
             "start": str(start),
@@ -423,6 +890,120 @@ def collect_arxiv_for_member(
         start += batch_size
 
     return records, None
+
+
+def collect_inspirehep_for_members(
+    *,
+    members: list[Member],
+    client: HttpClient,
+    config: LedgerConfig,
+    min_year: int,
+) -> tuple[list[SourcePaperRecord], list[dict[str, str]]]:
+    affiliation_id = _clean_optional(config.inspirehep_affiliation_id)
+    if not affiliation_id:
+        return [], [{"member": "<all>", "error": "InspireHEP affiliation id is not configured"}]
+
+    max_year = datetime.now(tz=timezone.utc).year
+    query = f"affid:{affiliation_id} and date {min_year}->{max_year}"
+    page_size = max(1, min(config.inspirehep_page_size, 250))
+    max_records = max(1, config.inspirehep_max_records)
+    params = {
+        "q": query,
+        "size": str(page_size),
+        "sort": "mostrecent",
+    }
+    next_url: str | None = f"{config.inspirehep_literature_api}?{urllib.parse.urlencode(params)}"
+
+    records: list[SourcePaperRecord] = []
+    errors: list[dict[str, str]] = []
+    processed = 0
+
+    while next_url and processed < max_records:
+        payload, error = client.fetch_json(next_url, headers={"Accept": "application/json"}, prefer="requests")
+        if error or not isinstance(payload, dict):
+            if records:
+                errors.append({"member": "<all>", "error": error or "Invalid InspireHEP payload"})
+                return records, errors
+            return [], [{"member": "<all>", "error": error or "Invalid InspireHEP payload"}]
+
+        hits = payload.get("hits") if isinstance(payload.get("hits"), dict) else {}
+        rows = hits.get("hits") if isinstance(hits, dict) else []
+        if not isinstance(rows, list) or not rows:
+            break
+
+        for row in rows:
+            if processed >= max_records:
+                break
+            processed += 1
+            if not isinstance(row, dict):
+                continue
+
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if not metadata:
+                continue
+
+            title = _inspire_title(metadata)
+            if not title:
+                continue
+
+            published_date = _inspire_published_date(metadata)
+            year = _year_from_text(published_date)
+            if year is None:
+                year = _inspire_publication_year(metadata)
+            if year is not None and year < min_year:
+                continue
+
+            authors = _inspire_authors(metadata)
+            if not authors:
+                continue
+
+            matched_members = [
+                member.name
+                for member in members
+                if any(_author_matches_member(member.name, author) for author in authors)
+            ]
+            if not matched_members:
+                continue
+
+            doi = _inspire_doi(metadata)
+            abstract = _inspire_abstract(metadata)
+            venue = _inspire_venue(metadata)
+            landing_page = _inspire_landing_page(metadata)
+            pdf_url = _inspire_pdf_url(metadata)
+            source_id = doi or _inspire_source_id(metadata, title=title, year=year)
+
+            for member_name in matched_members:
+                records.append(
+                    SourcePaperRecord(
+                        source="inspirehep",
+                        source_id=source_id,
+                        member_name=member_name,
+                        title=title,
+                        year=year,
+                        published_date=published_date,
+                        venue=venue,
+                        doi=doi,
+                        authors=authors,
+                        abstract=abstract,
+                        landing_page_url=landing_page,
+                        pdf_url=pdf_url,
+                        relevance_score=0.88,
+                        raw=(
+                            None
+                            if not config.include_raw_payloads
+                            else {
+                                "control_number": metadata.get("control_number"),
+                                "arxiv_eprints": metadata.get("arxiv_eprints"),
+                            }
+                        ),
+                    )
+                )
+
+        links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+        next_candidate = links.get("next") if isinstance(links, dict) else None
+        next_url = next_candidate if isinstance(next_candidate, str) and next_candidate.strip() else None
+
+    return records, errors
 
 
 def collect_google_scholar_for_member(
@@ -636,9 +1217,613 @@ def _score_author_name(target: str, candidate: str) -> float:
     return score
 
 
+def _arxiv_author_query(member_name: str) -> str:
+    cleaned = _clean_text(member_name)
+    if not cleaned:
+        return 'au:""'
+
+    tokens = _tokens(cleaned)
+    variants = [cleaned]
+    if len(tokens) >= 2:
+        first = tokens[0]
+        last = tokens[-1]
+        variants.append(f"{first} {last}")
+        variants.append(f"{first[0]} {last}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in variants:
+        item = _clean_text(value)
+        key = item.lower()
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    if len(deduped) == 1:
+        return f'au:"{deduped[0]}"'
+    return " OR ".join([f'au:"{value}"' for value in deduped])
+
+
 def _tokens(value: str) -> list[str]:
     cleaned = re.sub(r"[^A-Za-z ]", " ", value or "")
     return [part.lower() for part in cleaned.split() if part]
+
+
+def _datacite_title(attrs: dict) -> str:
+    titles = attrs.get("titles") if isinstance(attrs.get("titles"), list) else []
+    for item in titles:
+        if not isinstance(item, dict):
+            continue
+        value = _clean_text(str(item.get("title", "")))
+        if value:
+            return value
+    return ""
+
+
+def _datacite_creators(raw_creators: object) -> list[str]:
+    if not isinstance(raw_creators, list):
+        return []
+    names: list[str] = []
+    for creator in raw_creators:
+        if not isinstance(creator, dict):
+            continue
+        literal = _clean_optional(str(creator.get("name", "")))
+        given = _clean_optional(str(creator.get("givenName", "")))
+        family = _clean_optional(str(creator.get("familyName", "")))
+        if literal:
+            names.append(literal)
+        elif given or family:
+            names.append(_clean_text(" ".join(part for part in [given or "", family or ""] if part)))
+    return _merge_unique(names)
+
+
+def _datacite_abstract(attrs: dict) -> str | None:
+    descriptions = attrs.get("descriptions") if isinstance(attrs.get("descriptions"), list) else []
+    for item in descriptions:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_optional(str(item.get("description", "")))
+        if text:
+            return text
+    return None
+
+
+def _datacite_pdf_url(attrs: dict) -> str | None:
+    content_urls = attrs.get("contentUrl") if isinstance(attrs.get("contentUrl"), list) else []
+    for item in content_urls:
+        candidate = _clean_optional(str(item))
+        if not candidate:
+            continue
+        if candidate.lower().endswith(".pdf") or "/pdf" in candidate.lower():
+            return candidate
+    return None
+
+
+def _europe_pmc_authors(row: dict) -> list[str]:
+    raw = _clean_optional(str(row.get("authorString", "")))
+    if not raw:
+        return []
+    values = [_clean_text(part) for part in re.split(r"[;,]", raw)]
+    return [value for value in values if value]
+
+
+def _europe_pmc_pdf_url(row: dict) -> str | None:
+    full_texts = row.get("fullTextUrlList") if isinstance(row.get("fullTextUrlList"), dict) else {}
+    links = full_texts.get("fullTextUrl") if isinstance(full_texts, dict) else []
+    if isinstance(links, dict):
+        links = [links]
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            url = _clean_optional(str(link.get("url", "")))
+            style = _clean_optional(str(link.get("documentStyle", ""))) or ""
+            if not url:
+                continue
+            if "pdf" in style.lower() or url.lower().endswith(".pdf") or "/pdf" in url.lower():
+                return url
+
+    pmcid = _normalize_pmcid(_clean_optional(str(row.get("pmcid", ""))))
+    if pmcid:
+        return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
+    return None
+
+
+def _normalize_pmcid(value: str | None) -> str | None:
+    text = _clean_optional(value)
+    if not text:
+        return None
+    if text.upper().startswith("PMC"):
+        return "PMC" + text[3:]
+    digits = re.sub(r"\D+", "", text)
+    if digits:
+        return f"PMC{digits}"
+    return text
+
+
+def _pubmed_author_query(member_name: str, *, min_year: int) -> str:
+    tokens = _tokens(member_name)
+    if len(tokens) < 2:
+        return f'"{member_name}"[Author]'
+    last = tokens[-1]
+    first = tokens[0]
+    initial = first[0]
+    author_variants = [
+        f'"{last} {initial}"[Author]',
+        f'"{member_name}"[Author]',
+    ]
+    author_clause = " OR ".join(author_variants)
+    date_clause = f'("{min_year}/01/01"[Date - Publication] : "3000"[Date - Publication])'
+    return f"({author_clause}) AND {date_clause}"
+
+
+def _pubmed_id_list(payload: dict) -> list[str]:
+    result = payload.get("esearchresult") if isinstance(payload.get("esearchresult"), dict) else {}
+    ids = result.get("idlist") if isinstance(result, dict) else []
+    if not isinstance(ids, list):
+        return []
+    return [str(item).strip() for item in ids if str(item).strip()]
+
+
+def _parse_pubmed_fetch_xml(xml_text: str) -> tuple[list[dict], str | None]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        return [], f"Invalid PubMed XML: {exc}"
+
+    rows: list[dict] = []
+    for article in root.findall(".//PubmedArticle"):
+        citation = article.find("MedlineCitation")
+        if citation is None:
+            continue
+        article_node = citation.find("Article")
+        if article_node is None:
+            continue
+
+        pmid = _clean_optional(_xml_text(citation.find("PMID")))
+        title = _clean_optional(_clean_text(_xml_text(article_node.find("ArticleTitle"))))
+        if not pmid or not title:
+            continue
+
+        year, published_date = _pubmed_pubdate(citation, article_node)
+        doi, pmcid = _pubmed_ids(article, article_node)
+        authors = _pubmed_full_authors(article_node)
+        abstract = _pubmed_abstract(article_node)
+        journal = _clean_optional(_clean_text(_xml_text(article_node.find("Journal/Title"))))
+
+        rows.append(
+            {
+                "pmid": pmid,
+                "title": title,
+                "year": year,
+                "published_date": published_date,
+                "doi": doi,
+                "pmcid": pmcid,
+                "authors": authors,
+                "journal": journal,
+                "abstract": abstract,
+            }
+        )
+
+    return rows, None
+
+
+def _pubmed_pubdate(citation: ET.Element, article_node: ET.Element) -> tuple[int | None, str | None]:
+    candidates = [
+        article_node.find("ArticleDate"),
+        article_node.find("Journal/JournalIssue/PubDate"),
+    ]
+    for node in candidates:
+        if node is None:
+            continue
+        year = _safe_int(_xml_text(node.find("Year")))
+        month = _pubmed_month_to_num(_xml_text(node.find("Month")))
+        day = _safe_int(_xml_text(node.find("Day"))) or 1
+        if year is None:
+            medline = _clean_optional(_xml_text(node.find("MedlineDate")))
+            year = _year_from_text(medline)
+            if year is None:
+                continue
+        return year, f"{year:04d}-{month:02d}-{day:02d}"
+
+    completed_year = _safe_int(_xml_text(citation.find("DateCompleted/Year")))
+    if completed_year is not None:
+        return completed_year, f"{completed_year:04d}-01-01"
+    return None, None
+
+
+def _pubmed_month_to_num(value: str) -> int:
+    text = _clean_optional(value)
+    if not text:
+        return 1
+    as_int = _safe_int(text)
+    if as_int is not None:
+        return max(1, min(as_int, 12))
+    key = text.strip()[:3].lower()
+    mapping = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    return mapping.get(key, 1)
+
+
+def _pubmed_ids(article: ET.Element, article_node: ET.Element) -> tuple[str | None, str | None]:
+    doi = None
+    pmcid = None
+
+    for node in article.findall(".//ArticleId"):
+        id_type = (node.attrib.get("IdType", "") or "").strip().lower()
+        value = _clean_optional(_xml_text(node))
+        if not value:
+            continue
+        if id_type == "doi" and doi is None:
+            doi = _normalize_doi(value)
+        elif id_type == "pmc" and pmcid is None:
+            pmcid = _normalize_pmcid(value)
+
+    if doi is None:
+        for node in article_node.findall("ELocationID"):
+            id_type = (node.attrib.get("EIdType", "") or "").strip().lower()
+            value = _clean_optional(_xml_text(node))
+            if id_type == "doi" and value:
+                doi = _normalize_doi(value)
+                break
+
+    return doi, pmcid
+
+
+def _pubmed_full_authors(article_node: ET.Element) -> list[str]:
+    authors: list[str] = []
+    for author in article_node.findall("AuthorList/Author"):
+        collective = _clean_optional(_xml_text(author.find("CollectiveName")))
+        if collective:
+            authors.append(collective)
+            continue
+
+        last = _clean_optional(_xml_text(author.find("LastName")))
+        fore = _clean_optional(_xml_text(author.find("ForeName")))
+        initials = _clean_optional(_xml_text(author.find("Initials")))
+
+        if fore and last:
+            authors.append(_clean_text(f"{fore} {last}"))
+        elif initials and last:
+            authors.append(_clean_text(f"{initials} {last}"))
+        elif last:
+            authors.append(last)
+    return _merge_unique(authors)
+
+
+def _pubmed_abstract(article_node: ET.Element) -> str | None:
+    parts: list[str] = []
+    for node in article_node.findall("Abstract/AbstractText"):
+        label = _clean_optional(node.attrib.get("Label"))
+        text = _clean_optional(_clean_text(_xml_text(node)))
+        if not text:
+            continue
+        if label:
+            parts.append(f"{label}: {text}")
+        else:
+            parts.append(text)
+    if not parts:
+        return None
+    return " ".join(parts)
+
+
+def _pubmed_author_matches_member(member_name: str, author_name: str) -> bool:
+    member_tokens = _tokens(member_name)
+    author_tokens = _tokens(author_name)
+    if len(member_tokens) < 2 or len(author_tokens) < 2:
+        return False
+
+    member_last = member_tokens[-1]
+    member_given = member_tokens[:-1]
+
+    if author_tokens[-1] == member_last:
+        return _pubmed_given_name_match(member_given, author_tokens[:-1])
+    if author_tokens[0] == member_last:
+        return _pubmed_given_name_match(member_given, author_tokens[1:])
+    return False
+
+
+def _pubmed_given_name_match(member_given_parts: list[str], author_given_parts: list[str]) -> bool:
+    if not member_given_parts or not author_given_parts:
+        return False
+
+    member_compact = "".join(member_given_parts)
+    author_compact = "".join(author_given_parts)
+    if not member_compact or not author_compact:
+        return False
+
+    if member_compact == author_compact:
+        return True
+
+    member_initials = "".join(part[0] for part in member_given_parts if part)
+    author_initials = "".join(part[0] for part in author_given_parts if part)
+    if author_compact == member_initials:
+        return True
+    if member_compact == author_initials and len(member_compact) <= 3:
+        return True
+    if len(author_compact) == 1 and author_compact == member_compact[0]:
+        return True
+    if len(member_compact) == 1 and member_compact == author_compact[0]:
+        return True
+    return False
+
+
+def _parse_openaire_results(xml_text: str) -> tuple[list[dict], str | None, int | None]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        return [], f"Invalid OpenAIRE XML: {exc}", None
+
+    total_pages = _safe_int(_first_local_text(root, "totalPages"))
+    rows: list[dict] = []
+
+    for result in _findall_local(root, "result"):
+        title = _first_local_text(result, "title")
+        if not title:
+            continue
+
+        creators = _all_local_text(result, "creator")
+        date_values = (
+            _all_local_text(result, "dateofacceptance")
+            + _all_local_text(result, "publicationdate")
+            + _all_local_text(result, "dateofcollection")
+        )
+        published_date = next((value for value in date_values if value), None)
+        venue = _first_local_text(result, "journal") or _first_local_text(result, "publisher")
+
+        urls = _merge_unique(_all_local_text(result, "url"))
+        pids = _merge_unique(_all_local_text(result, "pid"))
+        doi = _first_doi_from_values([*pids, *urls])
+        year = _year_from_text(published_date)
+        abstract = _first_local_text(result, "description")
+
+        rows.append(
+            {
+                "title": title,
+                "authors": _merge_unique(creators),
+                "published_date": published_date,
+                "year": year,
+                "venue": venue,
+                "doi": doi,
+                "urls": urls,
+                "abstract": abstract,
+            }
+        )
+
+    return rows, None, total_pages
+
+
+def _findall_local(node: ET.Element, local_name: str) -> list[ET.Element]:
+    out: list[ET.Element] = []
+    for child in node.iter():
+        if child.tag.split("}")[-1] == local_name:
+            out.append(child)
+    return out
+
+
+def _first_local_text(node: ET.Element, local_name: str) -> str | None:
+    for child in _findall_local(node, local_name):
+        text = _clean_optional(_xml_text(child))
+        if text:
+            return text
+    return None
+
+
+def _all_local_text(node: ET.Element, local_name: str) -> list[str]:
+    out: list[str] = []
+    for child in _findall_local(node, local_name):
+        text = _clean_optional(_xml_text(child))
+        if text:
+            out.append(text)
+    return out
+
+
+def _first_doi_from_values(values: list[str]) -> str | None:
+    for value in values:
+        doi = _normalize_doi(value)
+        if doi and doi.startswith("10."):
+            return doi
+        extracted = _extract_doi_from_text(value)
+        normalized = _normalize_doi(extracted)
+        if normalized:
+            return normalized
+    return None
+
+
+def _doaj_authors(raw_authors: object) -> list[str]:
+    if not isinstance(raw_authors, list):
+        return []
+    names: list[str] = []
+    for item in raw_authors:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_optional(str(item.get("name", "")))
+        if name:
+            names.append(name)
+    return _merge_unique(names)
+
+
+def _doaj_doi(raw_identifiers: object) -> str | None:
+    if not isinstance(raw_identifiers, list):
+        return None
+    for item in raw_identifiers:
+        if not isinstance(item, dict):
+            continue
+        id_type = _clean_optional(str(item.get("type", "")))
+        value = _clean_optional(str(item.get("id", "")))
+        if not value:
+            continue
+        if id_type and id_type.lower() == "doi":
+            return _normalize_doi(value)
+    for item in raw_identifiers:
+        if not isinstance(item, dict):
+            continue
+        value = _clean_optional(str(item.get("id", "")))
+        normalized = _normalize_doi(value)
+        if normalized:
+            return normalized
+    return None
+
+
+def _doaj_links(raw_links: object) -> list[str]:
+    if not isinstance(raw_links, list):
+        return []
+    values: list[str] = []
+    for item in raw_links:
+        if not isinstance(item, dict):
+            continue
+        url = _clean_optional(str(item.get("url", "")))
+        if url:
+            values.append(url)
+    return _merge_unique(values)
+
+
+def _doaj_journal_title(bibjson: dict) -> str | None:
+    journal = bibjson.get("journal") if isinstance(bibjson.get("journal"), dict) else {}
+    return _clean_optional(str(journal.get("title", ""))) if isinstance(journal, dict) else None
+
+
+def _inspire_title(metadata: dict) -> str:
+    titles = metadata.get("titles") if isinstance(metadata.get("titles"), list) else []
+    if not titles:
+        return ""
+    first = titles[0] if isinstance(titles[0], dict) else {}
+    return _clean_text(str((first or {}).get("title", "")))
+
+
+def _inspire_published_date(metadata: dict) -> str | None:
+    for key in ("preprint_date", "earliest_date", "legacy_creation_date"):
+        value = _clean_optional(str(metadata.get(key, "")))
+        if value:
+            return value
+    year = _inspire_publication_year(metadata)
+    if year:
+        return _year_to_iso(year)
+    return None
+
+
+def _inspire_publication_year(metadata: dict) -> int | None:
+    publication_info = metadata.get("publication_info") if isinstance(metadata.get("publication_info"), list) else []
+    if not publication_info:
+        return None
+    first = publication_info[0] if isinstance(publication_info[0], dict) else {}
+    return _safe_int((first or {}).get("year"))
+
+
+def _inspire_venue(metadata: dict) -> str | None:
+    publication_info = metadata.get("publication_info") if isinstance(metadata.get("publication_info"), list) else []
+    if publication_info and isinstance(publication_info[0], dict):
+        first = publication_info[0]
+        for key in ("journal_title", "conference_title", "pubinfo_freetext"):
+            value = _clean_optional(str(first.get(key, "")))
+            if value:
+                return value
+    return "InspireHEP"
+
+
+def _inspire_abstract(metadata: dict) -> str | None:
+    abstracts = metadata.get("abstracts") if isinstance(metadata.get("abstracts"), list) else []
+    if not abstracts:
+        return None
+    first = abstracts[0] if isinstance(abstracts[0], dict) else {}
+    return _clean_optional(_clean_text(str((first or {}).get("value", ""))))
+
+
+def _inspire_doi(metadata: dict) -> str | None:
+    dois = metadata.get("dois") if isinstance(metadata.get("dois"), list) else []
+    if not dois:
+        return None
+    first = dois[0] if isinstance(dois[0], dict) else {}
+    return _normalize_doi(str((first or {}).get("value", "")))
+
+
+def _inspire_landing_page(metadata: dict) -> str | None:
+    control_number = _safe_int(metadata.get("control_number"))
+    if control_number:
+        return f"https://inspirehep.net/literature/{control_number}"
+    return None
+
+
+def _inspire_pdf_url(metadata: dict) -> str | None:
+    documents = metadata.get("documents") if isinstance(metadata.get("documents"), list) else []
+    for doc in documents:
+        if not isinstance(doc, dict):
+            continue
+        candidate = _clean_optional(str(doc.get("url", "")))
+        if candidate and (candidate.lower().endswith(".pdf") or "/pdf" in candidate.lower()):
+            return candidate
+
+    arxiv = metadata.get("arxiv_eprints") if isinstance(metadata.get("arxiv_eprints"), list) else []
+    if arxiv and isinstance(arxiv[0], dict):
+        arxiv_id = _clean_optional(str(arxiv[0].get("value", "")))
+        if arxiv_id:
+            return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+    urls = metadata.get("urls") if isinstance(metadata.get("urls"), list) else []
+    for item in urls:
+        if not isinstance(item, dict):
+            continue
+        candidate = _clean_optional(str(item.get("value", "")))
+        if candidate and (candidate.lower().endswith(".pdf") or "/pdf" in candidate.lower()):
+            return candidate
+    return None
+
+
+def _inspire_authors(metadata: dict) -> list[str]:
+    raw = metadata.get("authors") if isinstance(metadata.get("authors"), list) else []
+    out: list[str] = []
+    for author in raw:
+        if not isinstance(author, dict):
+            continue
+        name = (
+            _clean_optional(str(author.get("full_name", "")))
+            or _clean_optional(str(author.get("full_name_unicode_normalized", "")))
+        )
+        if not name:
+            continue
+        out.append(_inspire_normalize_author(name))
+    return _merge_unique(out)
+
+
+def _inspire_normalize_author(value: str) -> str:
+    clean = _clean_text(value)
+    if "," not in clean:
+        return clean
+    left, right = clean.split(",", 1)
+    return _clean_text(f"{right} {left}")
+
+
+def _inspire_source_id(metadata: dict, *, title: str, year: int | None) -> str:
+    control_number = _safe_int(metadata.get("control_number"))
+    if control_number:
+        return f"inspirehep:{control_number}"
+    return _stable_id("inspirehep", title, year)
+
+
+def _merge_unique(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = _clean_text(value)
+        key = cleaned.lower()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
 
 
 def _author_matches_member(member_name: str, author_name: str) -> bool:
@@ -647,14 +1832,20 @@ def _author_matches_member(member_name: str, author_name: str) -> bool:
     if len(member_tokens) < 2 or len(author_tokens) < 2:
         return False
 
-    member_last = member_tokens[-1]
-    author_last = author_tokens[-1]
-    if member_last != author_last:
-        return False
-
     member_first = member_tokens[0]
+    member_last = member_tokens[-1]
     author_first = author_tokens[0]
-    return member_first == author_first or member_first[0] == author_first[0]
+    author_last = author_tokens[-1]
+
+    same_order = (
+        author_last == member_last
+        and (author_first == member_first or author_first[0] == member_first[0])
+    )
+    swapped_order = (
+        author_first == member_last
+        and (author_last == member_first or author_last[0] == member_first[0])
+    )
+    return same_order or swapped_order
 
 
 def _safe_int(value: object) -> int | None:

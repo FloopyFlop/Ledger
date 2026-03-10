@@ -1,5 +1,10 @@
 from ledger.models import CanonicalPaper
-from ledger.pipeline import _derive_pdf_candidates_for_canonical, _extract_arxiv_id, _openalex_work_pdf_candidates
+from ledger.pipeline import (
+    _build_award_document_summary,
+    _derive_pdf_candidates_for_canonical,
+    _extract_arxiv_id,
+    _openalex_work_pdf_candidates,
+)
 
 
 def test_extract_arxiv_id_from_dblp_abs_anchor() -> None:
@@ -64,3 +69,35 @@ def test_openalex_work_pdf_candidates_collects_pdf_urls() -> None:
     }
     candidates = _openalex_work_pdf_candidates(work)
     assert "https://www.mdpi.com/2313-433X/11/12/430/pdf?version=1764748658" in candidates
+
+
+def test_award_document_summary_is_compact_and_omits_abstract() -> None:
+    paper = CanonicalPaper(
+        canonical_id="doi:10.1126/sciadv.ady1167",
+        title="Liquid crystal-driven interfacial ordering of colloidal microplastics.",
+        normalized_title="liquidcrystaldriveninterfacialorderingofcolloidalmicroplastics",
+        year=2025,
+        published_date="2025-12-10",
+        venue="Science Advances",
+        doi="10.1126/sciadv.ady1167",
+        authors=["F Mukherjee", "Fengqi You", "NL Abbott"],
+        aimi_members=["Fengqi You", "Nicholas Abbott"],
+        abstract="Long abstract text should not appear in compact summary.",
+        urls=["https://doi.org/10.1126/sciadv.ady1167"],
+        pdf_urls=["https://example.org/paper.pdf"],
+        sources=["openalex", "crossref"],
+        award_mentioned_in_document=True,
+        document_award_mentions=["DMR-2433348"],
+        document_award_context="Supported by NSF DMR-2433348.",
+        document_pdf_url="https://example.org/paper.pdf",
+        document_pdf_local_path="/tmp/paper.pdf",
+        document_pdfa_path="/tmp/paper-pdfa.pdf",
+        document_pdfa_error=None,
+    )
+
+    summary = _build_award_document_summary([paper])
+    assert len(summary) == 1
+    first = summary[0]
+    assert first["doi"] == "10.1126/sciadv.ady1167"
+    assert first["pdfa_conversion_ok"] is True
+    assert "abstract" not in first

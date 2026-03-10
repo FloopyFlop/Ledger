@@ -80,6 +80,21 @@ def main() -> None:
     print(f"- Raw source records: {summary.raw_record_count}")
     print(f"- Canonical papers: {summary.canonical_paper_count}")
     print(f"- Metadata award matches: {summary.award_match_count}")
+    print(
+        "- Document scan: "
+        f"{'enabled' if summary.document_scan_enabled else 'disabled'} "
+        f"(mentions={summary.document_scan_mentions_count}, "
+        f"no_pdf={summary.document_scan_no_pdf_count}, "
+        f"download_fail={summary.document_scan_download_fail_count}, "
+        f"extract_fail={summary.document_scan_extract_fail_count}, "
+        f"pdfa_ok={summary.document_scan_pdfa_success_count}, "
+        f"pdfa_fail={summary.document_scan_pdfa_failure_count})"
+    )
+    if summary.target_doi_total > 0:
+        print(
+            f"- Target DOI coverage: {summary.target_doi_matched}/{summary.target_doi_total} "
+            f"(missing: {summary.target_doi_missing})"
+        )
     print(f"- Proxy attempts: {summary.proxy_attempt_count}")
     print(f"- Direct attempts: {summary.direct_attempt_count}")
     print("")
