@@ -105,6 +105,8 @@ class CanonicalPaper:
     award_mentioned_in_document: bool = False
     document_award_mentions: list[str] = field(default_factory=list)
     document_award_context: str | None = None
+    document_verification_kind: str | None = None
+    document_verification_url: str | None = None
     document_pdf_url: str | None = None
     document_pdf_local_path: str | None = None
     document_pdfa_path: str | None = None
@@ -126,6 +128,7 @@ class CollectionRunSummary:
     canonical_paper_count: int
     award_match_count: int
     document_scan_enabled: bool
+    document_scan_papers_scanned: int
     document_scan_mentions_count: int
     document_scan_no_pdf_count: int
     document_scan_download_fail_count: int
@@ -135,6 +138,8 @@ class CollectionRunSummary:
     target_doi_total: int
     target_doi_matched: int
     target_doi_missing: int
+    target_doi_award_verified: int
+    target_doi_award_missing: int
     proxy_attempt_count: int
     direct_attempt_count: int
 

@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+
+from bs4 import BeautifulSoup
 
 from .collectors import (
     collect_arxiv_for_member,
@@ -27,7 +30,7 @@ from .collectors import (
 from .config import LedgerConfig
 from .funding import compile_award_regexes, find_award_context, find_award_mentions
 from .models import CanonicalPaper, CollectionRunSummary, Member, SourcePaperRecord, to_json_dict
-from .net import HttpClient
+from .net import HttpClient, HttpResponse
 from .pdfs import (
     convert_pdf_to_pdfa,
     download_pdf,
@@ -53,6 +56,12 @@ SOURCE_ORDER = [
     "inspirehep",
     "google_scholar",
 ]
+
+EUROPE_PMC_FULLTEXT_XML_TEMPLATE = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+PMC_EFETCH_XML_TEMPLATE = (
+    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmcid}&retmode=xml"
+)
+PMCID_RE = re.compile(r"\bPMC\d+\b", re.IGNORECASE)
 
 
 class _LiveStatus:
@@ -258,9 +267,20 @@ def run_ledger(
         "pdfa_failure_count": 0,
     }
     if config.scan_pdfs_for_awards:
+        papers_for_scan = _select_papers_for_document_scan(
+            papers=canonical_papers,
+            target_dois=config.target_dois,
+            target_only=config.scan_target_dois_only,
+        )
+        if config.scan_target_dois_only and config.target_dois:
+            logger.info(
+                "Document scan mode: target DOIs only (%d paper(s) selected from %d)",
+                len(papers_for_scan),
+                len(canonical_papers),
+            )
         scan_started = time.monotonic()
         scan_stats = _scan_awards_from_documents(
-            papers=canonical_papers,
+            papers=papers_for_scan,
             client=client,
             run_dir=run_dir,
             award_regexes=award_regexes,
@@ -290,10 +310,20 @@ def run_ledger(
         )
     canonical_papers.sort(key=lambda paper: ((paper.year or 0), paper.title.lower()), reverse=True)
 
-    papers_with_award = [paper for paper in canonical_papers if paper.award_mentioned_in_metadata]
-    papers_without_award = [paper for paper in canonical_papers if not paper.award_mentioned_in_metadata]
+    if config.scan_pdfs_for_awards:
+        papers_with_award = [paper for paper in canonical_papers if paper.award_mentioned_in_document]
+        papers_without_award = [paper for paper in canonical_papers if not paper.award_mentioned_in_document]
+    else:
+        papers_with_award = [paper for paper in canonical_papers if paper.award_mentioned_in_metadata]
+        papers_without_award = [paper for paper in canonical_papers if not paper.award_mentioned_in_metadata]
+
+    _materialize_award_documents(run_dir=run_dir, papers_with_award=papers_with_award)
     award_document_summary = _build_award_document_summary(canonical_papers)
-    target_coverage = _compute_target_doi_coverage(config.target_dois, canonical_papers)
+    target_coverage = _compute_target_doi_coverage(
+        config.target_dois,
+        canonical_papers,
+        require_document_verification=config.scan_pdfs_for_awards,
+    )
 
     proxy_stats = client.proxy_stats()
 
@@ -311,6 +341,7 @@ def run_ledger(
         canonical_paper_count=len(canonical_papers),
         award_match_count=len(papers_with_award),
         document_scan_enabled=bool(config.scan_pdfs_for_awards),
+        document_scan_papers_scanned=int(scan_stats["papers_total"]),
         document_scan_mentions_count=int(scan_stats["mentions_count"]),
         document_scan_no_pdf_count=int(scan_stats["no_pdf_count"]),
         document_scan_download_fail_count=int(scan_stats["download_fail_count"]),
@@ -320,6 +351,8 @@ def run_ledger(
         target_doi_total=target_coverage["total"],
         target_doi_matched=target_coverage["matched_count"],
         target_doi_missing=target_coverage["missing_count"],
+        target_doi_award_verified=target_coverage["award_verified_count"],
+        target_doi_award_missing=target_coverage["award_verified_missing_count"],
         proxy_attempt_count=int(proxy_stats.get("proxy_attempt_count", 0)),
         direct_attempt_count=int(proxy_stats.get("direct_attempt_count", 0)),
     )
@@ -333,17 +366,27 @@ def run_ledger(
     _write_json(run_dir / "source_errors.json", source_errors)
     _write_json(run_dir / "proxy_audit.json", proxy_stats)
     _write_json(run_dir / "award_document_summary.json", award_document_summary)
+    _write_json(run_dir / "award_verified" / "summary.json", award_document_summary)
+    _write_json(
+        run_dir / "award_verified" / "papers.json",
+        [to_json_dict(paper) for paper in papers_with_award],
+    )
     if target_coverage["total"] > 0:
         _write_json(run_dir / "target_doi_coverage.json", target_coverage)
-    _write_json(run_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
     _write_json(
         run_dir / "papers_with_award_mention.json",
         [to_json_dict(paper) for paper in papers_with_award],
     )
     _write_json(
-        run_dir / "papers_without_award_mention.json",
-        [to_json_dict(paper) for paper in papers_without_award],
+        run_dir / "award_verified" / "papers_with_award_mention.json",
+        [to_json_dict(paper) for paper in papers_with_award],
     )
+    if config.write_full_corpus_artifacts:
+        _write_json(run_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
+        _write_json(
+            run_dir / "papers_without_award_mention.json",
+            [to_json_dict(paper) for paper in papers_without_award],
+        )
 
     report = _render_report(summary, papers_with_award)
     (run_dir / "report.md").write_text(report, encoding="utf-8")
@@ -351,25 +394,39 @@ def run_ledger(
     # Convenience latest snapshots.
     _write_json(latest_dir / "summary.json", to_json_dict(summary))
     _write_json(latest_dir / "award_document_summary.json", award_document_summary)
+    _write_json(latest_dir / "award_verified" / "summary.json", award_document_summary)
+    _write_json(
+        latest_dir / "award_verified" / "papers.json",
+        [to_json_dict(paper) for paper in papers_with_award],
+    )
     if target_coverage["total"] > 0:
         _write_json(latest_dir / "target_doi_coverage.json", target_coverage)
-    _write_json(latest_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
     _write_json(
         latest_dir / "papers_with_award_mention.json",
         [to_json_dict(paper) for paper in papers_with_award],
     )
+    _write_json(
+        latest_dir / "award_verified" / "papers_with_award_mention.json",
+        [to_json_dict(paper) for paper in papers_with_award],
+    )
+    if config.write_full_corpus_artifacts:
+        _write_json(latest_dir / "papers_canonical.json", [to_json_dict(paper) for paper in canonical_papers])
+    else:
+        _remove_if_exists(latest_dir / "papers_canonical.json")
+        _remove_if_exists(latest_dir / "papers_without_award_mention.json")
 
     logger.info("Ledger pipeline finished in %s", _format_elapsed(time.monotonic() - run_clock_start))
     if target_coverage["total"] > 0:
         logger.info(
-            "Target DOI coverage: %d/%d matched (%d missing)",
+            "Target DOI coverage: %d/%d found, %d/%d award-verified",
             target_coverage["matched_count"],
             target_coverage["total"],
-            target_coverage["missing_count"],
+            target_coverage["award_verified_count"],
+            target_coverage["total"],
         )
-        if config.fail_on_missing_target_dois and target_coverage["missing_count"] > 0:
-            missing = ", ".join(target_coverage["missing"])
-            raise RuntimeError(f"Missing target DOI(s): {missing}")
+        if config.fail_on_missing_target_dois and target_coverage["award_verified_missing_count"] > 0:
+            missing = ", ".join(target_coverage["award_verified_missing"])
+            raise RuntimeError(f"Target DOI(s) not verified into papers_with_award_mention: {missing}")
 
     return summary
 
@@ -675,6 +732,32 @@ def _openalex_work_pdf_candidates(work: dict) -> list[str]:
     return candidates
 
 
+def _select_papers_for_document_scan(
+    *,
+    papers: list[CanonicalPaper],
+    target_dois: list[str],
+    target_only: bool,
+) -> list[CanonicalPaper]:
+    if not target_only:
+        return papers
+
+    normalized_targets: set[str] = set()
+    for value in target_dois:
+        cleaned = _clean_text(value).lower()
+        if cleaned:
+            normalized_targets.add(cleaned)
+
+    if not normalized_targets:
+        return papers
+
+    selected: list[CanonicalPaper] = []
+    for paper in papers:
+        doi = _clean_text(paper.doi or "").lower()
+        if doi and doi in normalized_targets:
+            selected.append(paper)
+    return selected
+
+
 def _scan_awards_from_documents(
     *,
     papers: list[CanonicalPaper],
@@ -834,6 +917,8 @@ def _scan_single_paper_for_award(
             paper.award_mentioned_in_document = True
             paper.document_award_mentions = mentions
             paper.document_award_context = find_award_context(text, mentions)
+            paper.document_verification_kind = "pdf"
+            paper.document_verification_url = pdf_url
             paper.award_mentions = _merge_string_lists(paper.award_mentions, mentions)
             paper.award_mentioned_in_metadata = True
             if convert_to_pdfa:
@@ -859,6 +944,25 @@ def _scan_single_paper_for_award(
                         paper.document_pdfa_error = pdfa_error or "PDF/A conversion failed"
                     pdfa_failure_count += 1
         break
+
+    if not paper.award_mentioned_in_document:
+        text_source_stats = _scan_text_sources_for_award(
+            paper=paper,
+            client=client,
+            award_regexes=award_regexes,
+        )
+        if text_source_stats["matched"]:
+            paper.document_scan_error = None
+            return {
+                "mentions_count": 1,
+                "no_pdf_count": 0,
+                "download_fail_count": 0,
+                "extract_fail_count": 0,
+                "pdfa_success_count": pdfa_success_count,
+                "pdfa_failure_count": pdfa_failure_count,
+            }
+        if text_source_stats["last_error"] and last_error is None:
+            last_error = text_source_stats["last_error"]
 
     if not downloaded_any and last_error:
         paper.document_scan_error = last_error
@@ -891,6 +995,159 @@ def _scan_single_paper_for_award(
         "pdfa_success_count": pdfa_success_count,
         "pdfa_failure_count": pdfa_failure_count,
     }
+
+
+def _scan_text_sources_for_award(
+    *,
+    paper: CanonicalPaper,
+    client: HttpClient,
+    award_regexes,
+) -> dict[str, object]:
+    extracted_any = False
+    last_error: str | None = None
+
+    for source_kind, url, prefer in _derive_document_text_candidates(paper):
+        response = client.fetch(
+            url,
+            headers={"Accept": "application/xml,text/xml,text/html,application/xhtml+xml;q=0.9,*/*;q=0.1"},
+            prefer=prefer,
+        )
+        if response.error:
+            last_error = response.error
+            continue
+        if response.status_code and response.status_code >= 400:
+            last_error = f"HTTP {response.status_code}"
+            continue
+        searchable_text = _extract_searchable_text_from_response(response)
+        if not searchable_text:
+            last_error = "No searchable full-text content"
+            continue
+
+        extracted_any = True
+        mentions = find_award_mentions(searchable_text, award_regexes)
+        if not mentions:
+            continue
+
+        verification_url = response.final_url or url
+        paper.award_mentioned_in_document = True
+        paper.document_award_mentions = mentions
+        paper.document_award_context = find_award_context(searchable_text, mentions)
+        paper.document_verification_kind = source_kind
+        paper.document_verification_url = verification_url
+        paper.award_mentions = _merge_string_lists(paper.award_mentions, mentions)
+        paper.award_mentioned_in_metadata = True
+        return {
+            "matched": True,
+            "extracted_any": extracted_any,
+            "last_error": None,
+        }
+
+    return {
+        "matched": False,
+        "extracted_any": extracted_any,
+        "last_error": last_error,
+    }
+
+
+def _derive_document_text_candidates(paper: CanonicalPaper) -> list[tuple[str, str, str]]:
+    candidates: list[tuple[str, str, str]] = []
+
+    for pmcid in _extract_pmcids_for_canonical(paper):
+        candidates.append(
+            (
+                "europe_pmc_fulltext_xml",
+                EUROPE_PMC_FULLTEXT_XML_TEMPLATE.format(pmcid=pmcid),
+                "requests",
+            )
+        )
+        candidates.append(
+            (
+                "pmc_efetch_xml",
+                PMC_EFETCH_XML_TEMPLATE.format(pmcid=pmcid),
+                "requests",
+            )
+        )
+
+    landing_urls: list[str] = []
+    landing_urls = _merge_string_lists(landing_urls, paper.urls)
+    for source_meta in paper.source_records:
+        landing_page_url = source_meta.get("landing_page_url")
+        if isinstance(landing_page_url, str) and landing_page_url.strip():
+            landing_urls = _merge_string_lists(landing_urls, [landing_page_url.strip()])
+
+    for url in landing_urls:
+        candidates.append(("landing_page_text", url, "auto"))
+
+    deduped: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source_kind, url, prefer in candidates:
+        key = (source_kind, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((source_kind, url, prefer))
+    return deduped
+
+
+def _extract_pmcids_for_canonical(paper: CanonicalPaper) -> list[str]:
+    values: list[str] = []
+    values = _merge_string_lists(values, paper.urls)
+    values = _merge_string_lists(values, paper.pdf_urls)
+    if paper.doi:
+        values = _merge_string_lists(values, [paper.doi])
+
+    for source_meta in paper.source_records:
+        for key in ("source_id", "landing_page_url", "pdf_url"):
+            raw = source_meta.get(key)
+            if isinstance(raw, str) and raw.strip():
+                values = _merge_string_lists(values, [raw.strip()])
+
+    pmcids: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for match in PMCID_RE.finditer(value):
+            pmcid = match.group(0).upper()
+            if pmcid in seen:
+                continue
+            seen.add(pmcid)
+            pmcids.append(pmcid)
+    return pmcids
+
+
+def _extract_searchable_text_from_response(response: HttpResponse) -> str | None:
+    body = response.body or b""
+    if not body:
+        return None
+
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+
+    content_type = (response.content_type or "").lower()
+    looks_like_markup = (
+        "html" in content_type
+        or "xml" in content_type
+        or text.startswith("<")
+        or text.startswith("<?xml")
+    )
+    if not looks_like_markup:
+        return text
+
+    parser = "xml" if "xml" in content_type and "html" not in content_type else "lxml"
+    try:
+        soup = BeautifulSoup(text, parser)
+        if parser != "xml":
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+        extracted = " ".join(soup.stripped_strings)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+
+    fallback = re.sub(r"<[^>]+>", " ", text)
+    fallback = " ".join(fallback.split())
+    return fallback or None
 
 
 def _canonical_id(record: SourcePaperRecord) -> str:
@@ -961,6 +1218,38 @@ def _merge_string_lists(left: list[str], right: list[str]) -> list[str]:
     return out
 
 
+def _materialize_award_documents(*, run_dir: Path, papers_with_award: list[CanonicalPaper]) -> None:
+    award_dir = run_dir / "award_verified"
+    pdf_dir = award_dir / "pdf"
+    pdfa_dir = award_dir / "pdfa"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdfa_dir.mkdir(parents=True, exist_ok=True)
+
+    used_stems: set[str] = set()
+    for paper in papers_with_award:
+        base = safe_file_stem(paper.doi or paper.canonical_id)
+        stem = base
+        suffix = 2
+        while stem in used_stems:
+            stem = f"{base}_{suffix}"
+            suffix += 1
+        used_stems.add(stem)
+
+        pdf_src = Path(paper.document_pdf_local_path) if paper.document_pdf_local_path else None
+        if pdf_src and pdf_src.exists():
+            pdf_dst = pdf_dir / f"{stem}.pdf"
+            if pdf_src.resolve() != pdf_dst.resolve():
+                shutil.copy2(pdf_src, pdf_dst)
+            paper.document_pdf_local_path = str(pdf_dst)
+
+        pdfa_src = Path(paper.document_pdfa_path) if paper.document_pdfa_path else None
+        if pdfa_src and pdfa_src.exists():
+            pdfa_dst = pdfa_dir / f"{stem}.pdf"
+            if pdfa_src.resolve() != pdfa_dst.resolve():
+                shutil.copy2(pdfa_src, pdfa_dst)
+            paper.document_pdfa_path = str(pdfa_dst)
+
+
 def _build_award_document_summary(papers: list[CanonicalPaper]) -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for paper in papers:
@@ -977,6 +1266,8 @@ def _build_award_document_summary(papers: list[CanonicalPaper]) -> list[dict[str
                 "sources": paper.sources,
                 "award_mentions": paper.document_award_mentions,
                 "award_context": paper.document_award_context,
+                "document_verification_kind": paper.document_verification_kind,
+                "document_verification_url": paper.document_verification_url,
                 "document_pdf_url": paper.document_pdf_url,
                 "document_pdf_local_path": paper.document_pdf_local_path,
                 "document_pdfa_path": paper.document_pdfa_path,
@@ -1003,7 +1294,8 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
     lines.append(
         "- Document scan: "
         f"{'enabled' if summary.document_scan_enabled else 'disabled'} "
-        f"(mentions={summary.document_scan_mentions_count}, "
+        f"(papers={summary.document_scan_papers_scanned}, "
+        f"mentions={summary.document_scan_mentions_count}, "
         f"no_pdf={summary.document_scan_no_pdf_count}, "
         f"download_fail={summary.document_scan_download_fail_count}, "
         f"extract_fail={summary.document_scan_extract_fail_count}, "
@@ -1014,6 +1306,10 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
         lines.append(
             f"- Target DOI coverage: {summary.target_doi_matched}/{summary.target_doi_total} "
             f"(missing: {summary.target_doi_missing})"
+        )
+        lines.append(
+            f"- Target DOI award verification: {summary.target_doi_award_verified}/{summary.target_doi_total} "
+            f"(missing: {summary.target_doi_award_missing})"
         )
     lines.append(f"- Proxy attempts: {summary.proxy_attempt_count}")
     lines.append(f"- Direct attempts: {summary.direct_attempt_count}")
@@ -1153,6 +1449,14 @@ def _write_json(path: Path, payload) -> None:
         handle.write("\n")
 
 
+def _remove_if_exists(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 def _progress_bar(completed: int, total: int, *, width: int = 18) -> str:
     if total <= 0:
         return "[" + ("-" * width) + "]"
@@ -1175,7 +1479,12 @@ def _utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalPaper]) -> dict[str, object]:
+def _compute_target_doi_coverage(
+    target_dois: list[str],
+    papers: list[CanonicalPaper],
+    *,
+    require_document_verification: bool = True,
+) -> dict[str, object]:
     dedup_targets: list[str] = []
     seen: set[str] = set()
     for value in target_dois:
@@ -1195,6 +1504,8 @@ def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalP
 
     matched: list[str] = []
     missing: list[str] = []
+    award_verified: list[str] = []
+    award_verified_missing: list[str] = []
     details: list[dict[str, object]] = []
 
     for doi in dedup_targets:
@@ -1204,6 +1515,14 @@ def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalP
             details.append({"doi": doi, "found": False})
             continue
         matched.append(doi)
+        if require_document_verification:
+            is_award_verified = bool(paper.award_mentioned_in_document)
+        else:
+            is_award_verified = bool(paper.award_mentioned_in_document or paper.award_mentioned_in_metadata)
+        if is_award_verified:
+            award_verified.append(doi)
+        else:
+            award_verified_missing.append(doi)
         details.append(
             {
                 "doi": doi,
@@ -1211,6 +1530,12 @@ def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalP
                 "title": paper.title,
                 "aimi_members": paper.aimi_members,
                 "sources": paper.sources,
+                "award_verified": is_award_verified,
+                "award_mentioned_in_document": paper.award_mentioned_in_document,
+                "award_mentioned_in_metadata": paper.award_mentioned_in_metadata,
+                "document_verification_kind": paper.document_verification_kind,
+                "document_verification_url": paper.document_verification_url,
+                "document_scan_error": paper.document_scan_error,
             }
         )
 
@@ -1218,7 +1543,11 @@ def _compute_target_doi_coverage(target_dois: list[str], papers: list[CanonicalP
         "total": len(dedup_targets),
         "matched_count": len(matched),
         "missing_count": len(missing),
+        "award_verified_count": len(award_verified),
+        "award_verified_missing_count": len(award_verified_missing),
         "matched": matched,
         "missing": missing,
+        "award_verified": award_verified,
+        "award_verified_missing": award_verified_missing,
         "details": details,
     }

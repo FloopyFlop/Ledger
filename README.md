@@ -82,12 +82,21 @@ Each run writes to `output/runs/<timestamp>/`:
 - `source_errors.json`
 - `proxy_audit.json`
 - `award_document_summary.json`
-- `papers_canonical.json`
 - `papers_with_award_mention.json`
-- `papers_without_award_mention.json`
 - `summary.json`
 - `report.md`
 - `target_doi_coverage.json` (when target DOIs are configured)
+- `award_verified/summary.json`
+- `award_verified/papers.json`
+- `award_verified/papers_with_award_mention.json`
+- `award_verified/pdf/*.pdf` (downloaded award-verified PDFs)
+- `award_verified/pdfa/*.pdf` (PDF/A outputs when conversion succeeds)
+
+By default, Ledger is award-focused and does **not** write large non-award archives.
+Set `LEDGER_WRITE_FULL_CORPUS_ARTIFACTS=true` to also write:
+
+- `papers_canonical.json`
+- `papers_without_award_mention.json`
 
 Latest snapshots are also copied to `output/latest/`.
 
@@ -115,6 +124,8 @@ Canonical papers (`papers_canonical.json`) include:
 - `award_mentioned_in_document`
 - `document_award_mentions`
 - `document_award_context`
+- `document_verification_kind`
+- `document_verification_url`
 - `document_pdf_url`
 - `document_pdf_local_path`
 - `document_pdfa_path`
@@ -125,8 +136,10 @@ Canonical papers (`papers_canonical.json`) include:
 
 - Google Scholar can rate-limit or challenge traffic; Ledger records source errors and continues.
 - Award matching checks metadata and can also scan downloaded PDFs (`LEDGER_SCAN_PDFS_FOR_AWARDS=true`).
+- For strict DOI verification loops, set `LEDGER_SCAN_TARGET_DOIS_ONLY=true` to scan only configured target DOI papers.
+- `papers_with_award_mention.json` is document-verified when document scan is enabled.
 - When document scanning is enabled, Ledger can convert award-containing PDFs to PDF/A (`LEDGER_CONVERT_AWARD_PDFS_TO_PDFA=true`) and records outcomes in `award_document_summary.json`.
 - PDF/A conversion uses Ghostscript (`LEDGER_GHOSTSCRIPT_BIN`, default `gs`); if unavailable, conversion errors are captured per document in the summary JSON.
 - Default award regexes always include number-only matching for `2433348`.
-- Some publisher PDF endpoints return `HTTP 403` through proxy-only routing; those are captured in `document_scan_error`.
-- You can enforce expected-paper coverage by setting `LEDGER_TARGET_DOIS` or `LEDGER_TARGET_DOI_FILE` and enabling `LEDGER_FAIL_ON_MISSING_TARGET_DOIS=true`.
+- Some publisher PDF endpoints return `HTTP 403` through proxy-only routing; Ledger now falls back to structured full-text XML (Europe PMC/PMC efetch) when available.
+- You can enforce expected-paper coverage by setting `LEDGER_TARGET_DOIS` or `LEDGER_TARGET_DOI_FILE` and enabling `LEDGER_FAIL_ON_MISSING_TARGET_DOIS=true`; the gate now enforces award-verified inclusion, not just DOI discovery.

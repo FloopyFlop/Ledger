@@ -271,6 +271,7 @@ class LedgerConfig:
     max_openaire_pages: int = 2
     max_doaj_pages: int = 2
     scan_pdfs_for_awards: bool = True
+    scan_target_dois_only: bool = False
     pdf_scan_max_mb: int = 30
     pdf_scan_max_pages: int = 120
     pdf_scan_max_candidates_per_paper: int = 3
@@ -278,6 +279,7 @@ class LedgerConfig:
     ghostscript_bin: str = "gs"
     pdfa_fallback_copy: bool = False
     include_raw_payloads: bool = False
+    write_full_corpus_artifacts: bool = False
     probe_sources_before_collection: bool = True
     fallback_member_names: list[str] = field(default_factory=lambda: list(DEFAULT_AIMI_MEMBER_NAMES))
 
@@ -386,6 +388,7 @@ class LedgerConfig:
             max_openaire_pages=max(1, _get_int("LEDGER_MAX_OPENAIRE_PAGES", 2)),
             max_doaj_pages=max(1, _get_int("LEDGER_MAX_DOAJ_PAGES", 2)),
             scan_pdfs_for_awards=_get_bool("LEDGER_SCAN_PDFS_FOR_AWARDS", True),
+            scan_target_dois_only=_get_bool("LEDGER_SCAN_TARGET_DOIS_ONLY", False),
             pdf_scan_max_mb=max(1, _get_int("LEDGER_PDF_SCAN_MAX_MB", 30)),
             pdf_scan_max_pages=max(1, _get_int("LEDGER_PDF_SCAN_MAX_PAGES", 120)),
             pdf_scan_max_candidates_per_paper=max(1, _get_int("LEDGER_PDF_SCAN_MAX_CANDIDATES_PER_PAPER", 3)),
@@ -393,6 +396,7 @@ class LedgerConfig:
             ghostscript_bin=_clean_optional(os.getenv("LEDGER_GHOSTSCRIPT_BIN")) or defaults.ghostscript_bin,
             pdfa_fallback_copy=_get_bool("LEDGER_PDFA_FALLBACK_COPY", False),
             include_raw_payloads=_get_bool("LEDGER_INCLUDE_RAW_PAYLOADS", False),
+            write_full_corpus_artifacts=_get_bool("LEDGER_WRITE_FULL_CORPUS_ARTIFACTS", False),
             probe_sources_before_collection=_get_bool("LEDGER_PROBE_SOURCES_BEFORE_COLLECTION", True),
             fallback_member_names=_parse_list_env("LEDGER_MEMBER_NAMES", DEFAULT_AIMI_MEMBER_NAMES),
             award_patterns=_parse_list_env("LEDGER_AWARD_PATTERNS", DEFAULT_AWARD_PATTERNS),
