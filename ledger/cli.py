@@ -77,6 +77,11 @@ def main() -> None:
     print("Collection:")
     print(f"- Team members scraped: {summary.team_member_count}")
     print(f"- Lookback years: {summary.lookback_years}")
+    print(
+        f"- State cache: {'enabled' if summary.state_cache_enabled else 'disabled'} "
+        f"(new={summary.state_new_paper_count}, changed={summary.state_changed_paper_count}, "
+        f"unchanged={summary.state_unchanged_paper_count})"
+    )
     print(f"- Raw source records: {summary.raw_record_count}")
     print(f"- Canonical papers: {summary.canonical_paper_count}")
     print(f"- Award matches: {summary.award_match_count}")

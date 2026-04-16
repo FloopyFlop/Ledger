@@ -9,6 +9,7 @@ dependencies = [
   "cloudscraper>=1.2.71",
   "lxml>=5.2.0",
   "pypdf>=5.0.0",
+  "reportlab>=4.2.0",
   "requests>=2.32.0",
 ]
 
@@ -19,6 +20,8 @@ dev = [
 
 [project.scripts]
 ledger = "ledger.cli:main"
+ledger-pdfa-postprocess = "ledger.postprocess_pdfa:main"
+ledger-prepare-final-results = "ledger.finalize_results:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

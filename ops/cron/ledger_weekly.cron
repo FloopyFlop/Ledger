@@ -1,0 +1,2 @@
+# Weekly Ledger discovery run (Sundays at 02:15 local time)
+15 2 * * 0 /Users/abm/XVOL/Cornell/AIMI/Ledger/scripts/run_weekly.sh /Users/abm/XVOL/Cornell/AIMI/Ledger/.env

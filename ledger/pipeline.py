@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shutil
+import hashlib
 import sys
 import time
 import urllib.parse
@@ -39,6 +40,7 @@ from .pdfs import (
     safe_file_stem,
 )
 from .team import parse_team_members
+from .state import LedgerState, load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,8 @@ def run_ledger(
     latest_dir = base_output / "latest"
     run_dir.mkdir(parents=True, exist_ok=True)
     latest_dir.mkdir(parents=True, exist_ok=True)
+    state_cache_enabled = bool(config.enable_state_cache)
+    state = load_state(config.state_file) if state_cache_enabled else LedgerState()
 
     status = _LiveStatus()
     client = HttpClient(
@@ -241,6 +245,24 @@ def run_ledger(
         len(canonical_papers),
         _format_elapsed(time.monotonic() - canonicalize_started),
     )
+    paper_hashes = {paper.canonical_id: _paper_hash(paper) for paper in canonical_papers}
+    cache_stats = _classify_papers_against_cache(
+        papers=canonical_papers,
+        paper_hashes=paper_hashes,
+        state=state,
+    )
+    if state_cache_enabled:
+        _hydrate_cached_award_results(
+            papers=canonical_papers,
+            state=state,
+            unchanged_ids=cache_stats["unchanged_ids"],
+        )
+        logger.info(
+            "State cache: new=%d changed=%d unchanged=%d",
+            cache_stats["new_count"],
+            cache_stats["changed_count"],
+            cache_stats["unchanged_count"],
+        )
 
     enrich_started = time.monotonic()
     enrich_stats = _enrich_pdf_candidates(canonical_papers, client=client, config=config, status=status)
@@ -277,6 +299,19 @@ def run_ledger(
                 "Document scan mode: target DOIs only (%d paper(s) selected from %d)",
                 len(papers_for_scan),
                 len(canonical_papers),
+            )
+        if (
+            state_cache_enabled
+            and config.incremental_scan_only_new_or_changed
+            and not (config.scan_target_dois_only and config.target_dois)
+        ):
+            scan_candidates = set(cache_stats["new_ids"]) | set(cache_stats["changed_ids"])
+            before_count = len(papers_for_scan)
+            papers_for_scan = [paper for paper in papers_for_scan if paper.canonical_id in scan_candidates]
+            logger.info(
+                "Document scan mode: incremental new/changed only (%d selected from %d)",
+                len(papers_for_scan),
+                before_count,
             )
         scan_started = time.monotonic()
         scan_stats = _scan_awards_from_documents(
@@ -337,6 +372,10 @@ def run_ledger(
         source_record_counts=source_record_counts,
         source_error_counts=source_error_counts,
         source_probe_status=source_probe_status,
+        state_cache_enabled=state_cache_enabled,
+        state_new_paper_count=cache_stats["new_count"],
+        state_changed_paper_count=cache_stats["changed_count"],
+        state_unchanged_paper_count=cache_stats["unchanged_count"],
         raw_record_count=len(all_records),
         canonical_paper_count=len(canonical_papers),
         award_match_count=len(papers_with_award),
@@ -414,6 +453,28 @@ def run_ledger(
     else:
         _remove_if_exists(latest_dir / "papers_canonical.json")
         _remove_if_exists(latest_dir / "papers_without_award_mention.json")
+
+    cache_delta = {
+        "new_count": cache_stats["new_count"],
+        "changed_count": cache_stats["changed_count"],
+        "unchanged_count": cache_stats["unchanged_count"],
+        "new_ids": sorted(cache_stats["new_ids"]),
+        "changed_ids": sorted(cache_stats["changed_ids"]),
+    }
+    if state_cache_enabled:
+        _update_state_cache(
+            state=state,
+            papers=canonical_papers,
+            paper_hashes=paper_hashes,
+            run_started_at=run_started_at,
+            run_finished_at=run_finished_at,
+            output_dir=str(run_dir),
+        )
+        save_state(config.state_file, state)
+        _write_json(run_dir / "paper_cache_snapshot.json", state.paper_index)
+        _write_json(latest_dir / "paper_cache_snapshot.json", state.paper_index)
+        _write_json(run_dir / "paper_cache_delta.json", cache_delta)
+        _write_json(latest_dir / "paper_cache_delta.json", cache_delta)
 
     logger.info("Ledger pipeline finished in %s", _format_elapsed(time.monotonic() - run_clock_start))
     if target_coverage["total"] > 0:
@@ -758,6 +819,136 @@ def _select_papers_for_document_scan(
     return selected
 
 
+def _paper_hash(paper: CanonicalPaper) -> str:
+    payload = {
+        "canonical_id": paper.canonical_id,
+        "title": paper.title,
+        "year": paper.year,
+        "published_date": paper.published_date,
+        "venue": paper.venue,
+        "doi": paper.doi,
+        "authors": sorted(paper.authors),
+        "aimi_members": sorted(paper.aimi_members),
+        "urls": sorted(paper.urls),
+        "pdf_urls": sorted(paper.pdf_urls),
+        "sources": sorted(paper.sources),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _classify_papers_against_cache(
+    *,
+    papers: list[CanonicalPaper],
+    paper_hashes: dict[str, str],
+    state: LedgerState,
+) -> dict[str, object]:
+    new_ids: set[str] = set()
+    changed_ids: set[str] = set()
+    unchanged_ids: set[str] = set()
+
+    for paper in papers:
+        cid = paper.canonical_id
+        current_hash = paper_hashes.get(cid) or ""
+        previous = state.paper_index.get(cid, {})
+        previous_hash = str(previous.get("hash", "")).strip()
+        if not previous:
+            new_ids.add(cid)
+            continue
+        if previous_hash != current_hash:
+            changed_ids.add(cid)
+        else:
+            unchanged_ids.add(cid)
+
+    return {
+        "new_count": len(new_ids),
+        "changed_count": len(changed_ids),
+        "unchanged_count": len(unchanged_ids),
+        "new_ids": new_ids,
+        "changed_ids": changed_ids,
+        "unchanged_ids": unchanged_ids,
+    }
+
+
+def _hydrate_cached_award_results(
+    *,
+    papers: list[CanonicalPaper],
+    state: LedgerState,
+    unchanged_ids: set[str],
+) -> None:
+    for paper in papers:
+        if paper.canonical_id not in unchanged_ids:
+            continue
+        entry = state.paper_index.get(paper.canonical_id)
+        if not isinstance(entry, dict):
+            continue
+        paper.award_mentioned_in_metadata = bool(entry.get("award_mentioned_in_metadata", False))
+        paper.award_mentioned_in_document = bool(entry.get("award_mentioned_in_document", False))
+        cached_mentions = entry.get("award_mentions")
+        if isinstance(cached_mentions, list):
+            paper.award_mentions = _merge_string_lists(
+                paper.award_mentions,
+                [str(value) for value in cached_mentions if str(value).strip()],
+            )
+        cached_doc_mentions = entry.get("document_award_mentions")
+        if isinstance(cached_doc_mentions, list):
+            paper.document_award_mentions = _merge_string_lists(
+                paper.document_award_mentions,
+                [str(value) for value in cached_doc_mentions if str(value).strip()],
+            )
+        verification_kind = entry.get("document_verification_kind")
+        if isinstance(verification_kind, str) and verification_kind.strip():
+            paper.document_verification_kind = verification_kind
+        verification_url = entry.get("document_verification_url")
+        if isinstance(verification_url, str) and verification_url.strip():
+            paper.document_verification_url = verification_url
+
+
+def _update_state_cache(
+    *,
+    state: LedgerState,
+    papers: list[CanonicalPaper],
+    paper_hashes: dict[str, str],
+    run_started_at: str,
+    run_finished_at: str,
+    output_dir: str,
+) -> None:
+    state.last_run_started_at = run_started_at
+    state.last_run_finished_at = run_finished_at
+    state.last_output_dir = output_dir
+
+    existing = state.paper_index
+    updated: dict[str, dict[str, object]] = dict(existing)
+    for paper in papers:
+        cid = paper.canonical_id
+        previous = existing.get(cid, {})
+        first_seen_at = previous.get("first_seen_at", run_started_at)
+        updated[cid] = {
+            "hash": paper_hashes.get(cid) or _paper_hash(paper),
+            "canonical_id": cid,
+            "doi": paper.doi,
+            "title": paper.title,
+            "year": paper.year,
+            "published_date": paper.published_date,
+            "venue": paper.venue,
+            "sources": sorted(paper.sources),
+            "aimi_members": sorted(paper.aimi_members),
+            "award_mentioned_in_metadata": bool(paper.award_mentioned_in_metadata),
+            "award_mentioned_in_document": bool(paper.award_mentioned_in_document),
+            "award_mentions": list(paper.award_mentions),
+            "document_award_mentions": list(paper.document_award_mentions),
+            "document_verification_kind": paper.document_verification_kind,
+            "document_verification_url": paper.document_verification_url,
+            "document_scan_error": paper.document_scan_error,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": run_finished_at,
+            "last_output_dir": output_dir,
+        }
+
+    state.paper_index = updated
+    state.seen_paper_ids = set(updated.keys())
+
+
 def _scan_awards_from_documents(
     *,
     papers: list[CanonicalPaper],
@@ -878,17 +1069,7 @@ def _scan_single_paper_for_award(
     ghostscript_bin: str,
     pdfa_fallback_copy: bool,
 ) -> dict[str, int]:
-    if not paper.pdf_urls:
-        paper.document_scan_error = "No PDF candidates"
-        return {
-            "mentions_count": 0,
-            "no_pdf_count": 1,
-            "download_fail_count": 0,
-            "extract_fail_count": 0,
-            "pdfa_success_count": 0,
-            "pdfa_failure_count": 0,
-        }
-
+    had_initial_pdf_candidates = bool(paper.pdf_urls)
     stem = safe_file_stem(f"{paper.canonical_id}-{idx}")
     last_error: str | None = None
     downloaded_any = False
@@ -943,7 +1124,7 @@ def _scan_single_paper_for_award(
                     else:
                         paper.document_pdfa_error = pdfa_error or "PDF/A conversion failed"
                     pdfa_failure_count += 1
-        break
+            break
 
     if not paper.award_mentioned_in_document:
         text_source_stats = _scan_text_sources_for_award(
@@ -952,6 +1133,32 @@ def _scan_single_paper_for_award(
             award_regexes=award_regexes,
         )
         if text_source_stats["matched"]:
+            matched_source_kind = str(text_source_stats.get("matched_source_kind") or "")
+            matched_source_url = str(text_source_stats.get("matched_source_url") or "")
+            matched_raw_text = text_source_stats.get("matched_raw_text")
+            if (
+                matched_source_kind in {"europe_pmc_fulltext_xml", "pmc_efetch_xml"}
+                and isinstance(matched_raw_text, str)
+            ):
+                xml_pdf_candidates = _extract_pdf_candidates_from_fulltext_xml(
+                    xml_text=matched_raw_text,
+                    verification_url=matched_source_url,
+                )
+                paper.pdf_urls = _merge_string_lists(paper.pdf_urls, xml_pdf_candidates)
+
+            capture_stats = _capture_pdf_for_verified_paper(
+                paper=paper,
+                client=client,
+                temp_pdf_dir=temp_pdf_dir,
+                stem=stem,
+                max_pdf_mb=max_pdf_mb,
+                max_candidates_per_paper=max_candidates_per_paper,
+                convert_to_pdfa=convert_to_pdfa,
+                ghostscript_bin=ghostscript_bin,
+                pdfa_fallback_copy=pdfa_fallback_copy,
+            )
+            pdfa_success_count += int(capture_stats["pdfa_success_count"])
+            pdfa_failure_count += int(capture_stats["pdfa_failure_count"])
             paper.document_scan_error = None
             return {
                 "mentions_count": 1,
@@ -981,6 +1188,16 @@ def _scan_single_paper_for_award(
             "no_pdf_count": 0,
             "download_fail_count": 0,
             "extract_fail_count": 1,
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+    if not had_initial_pdf_candidates and not paper.award_mentioned_in_document:
+        paper.document_scan_error = paper.document_scan_error or "No PDF candidates"
+        return {
+            "mentions_count": 0,
+            "no_pdf_count": 1,
+            "download_fail_count": 0,
+            "extract_fail_count": 0,
             "pdfa_success_count": 0,
             "pdfa_failure_count": 0,
         }
@@ -1038,6 +1255,9 @@ def _scan_text_sources_for_award(
         paper.award_mentioned_in_metadata = True
         return {
             "matched": True,
+            "matched_source_kind": source_kind,
+            "matched_source_url": verification_url,
+            "matched_raw_text": _response_body_text(response),
             "extracted_any": extracted_any,
             "last_error": None,
         }
@@ -1148,6 +1368,112 @@ def _extract_searchable_text_from_response(response: HttpResponse) -> str | None
     fallback = re.sub(r"<[^>]+>", " ", text)
     fallback = " ".join(fallback.split())
     return fallback or None
+
+
+def _response_body_text(response: HttpResponse) -> str:
+    body = response.body or b""
+    if not body:
+        return ""
+    return body.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_candidates_from_fulltext_xml(*, xml_text: str, verification_url: str) -> list[str]:
+    candidates: list[str] = []
+    pmcid_match = PMCID_RE.search(verification_url or "")
+    pmcid = pmcid_match.group(0).upper() if pmcid_match else None
+
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+        for tag in soup.find_all("self-uri"):
+            href = tag.get("xlink:href") or tag.get("href")
+            if not isinstance(href, str):
+                continue
+            value = href.strip()
+            if not value or ".pdf" not in value.lower():
+                continue
+            if value.startswith("http://") or value.startswith("https://"):
+                candidates = _merge_string_lists(candidates, [value])
+                continue
+            if pmcid:
+                normalized = value.lstrip("/")
+                candidates = _merge_string_lists(
+                    candidates,
+                    [f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/bin/{normalized}"],
+                )
+    except Exception:
+        pass
+
+    if pmcid:
+        candidates = _merge_string_lists(
+            candidates,
+            [f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"],
+        )
+    return candidates
+
+
+def _capture_pdf_for_verified_paper(
+    *,
+    paper: CanonicalPaper,
+    client: HttpClient,
+    temp_pdf_dir: Path,
+    stem: str,
+    max_pdf_mb: int,
+    max_candidates_per_paper: int,
+    convert_to_pdfa: bool,
+    ghostscript_bin: str,
+    pdfa_fallback_copy: bool,
+) -> dict[str, int]:
+    pdfa_success_count = 0
+    pdfa_failure_count = 0
+
+    local_path = Path(paper.document_pdf_local_path) if paper.document_pdf_local_path else None
+    if not local_path or not local_path.exists():
+        local_path = None
+        for candidate_idx, pdf_url in enumerate(paper.pdf_urls[: max(1, max_candidates_per_paper * 2)], start=1):
+            destination = temp_pdf_dir / f"{stem}-verified-{candidate_idx}.pdf"
+            ok, _ = download_pdf(client, pdf_url, destination, max_pdf_mb=max_pdf_mb)
+            if not ok:
+                continue
+            local_path = destination
+            paper.document_pdf_url = pdf_url
+            paper.document_pdf_local_path = str(destination)
+            break
+
+    if not convert_to_pdfa:
+        return {
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 0,
+        }
+
+    if not local_path or not local_path.exists():
+        paper.document_pdfa_error = "No local PDF available for PDF/A conversion"
+        return {
+            "pdfa_success_count": 0,
+            "pdfa_failure_count": 1,
+        }
+
+    pdfa_dir = temp_pdf_dir.parent / "pdfa"
+    pdfa_path = pdfa_dir / f"{stem}-verified.pdf"
+    ok_pdfa, pdfa_error = convert_pdf_to_pdfa(local_path, pdfa_path, ghostscript_bin=ghostscript_bin)
+    if ok_pdfa:
+        paper.document_pdfa_path = str(pdfa_path)
+        paper.document_pdfa_error = None
+        pdfa_success_count += 1
+    else:
+        if pdfa_fallback_copy:
+            ensure_pdfa_copy(local_path, pdfa_path)
+            paper.document_pdfa_path = str(pdfa_path)
+            paper.document_pdfa_error = (
+                f"PDF/A conversion failed, copied original PDF instead: {pdfa_error}"
+            )
+        else:
+            paper.document_pdfa_error = pdfa_error or "PDF/A conversion failed"
+        pdfa_failure_count += 1
+
+    return {
+        "pdfa_success_count": pdfa_success_count,
+        "pdfa_failure_count": pdfa_failure_count,
+    }
 
 
 def _canonical_id(record: SourcePaperRecord) -> str:
@@ -1288,6 +1614,11 @@ def _render_report(summary: CollectionRunSummary, papers_with_award: list[Canoni
     lines.append("## Summary")
     lines.append(f"- Team members: {summary.team_member_count}")
     lines.append(f"- Lookback years: {summary.lookback_years}")
+    lines.append(
+        f"- State cache: {'enabled' if summary.state_cache_enabled else 'disabled'} "
+        f"(new={summary.state_new_paper_count}, changed={summary.state_changed_paper_count}, "
+        f"unchanged={summary.state_unchanged_paper_count})"
+    )
     lines.append(f"- Raw source records: {summary.raw_record_count}")
     lines.append(f"- Canonical papers: {summary.canonical_paper_count}")
     lines.append(f"- Award mentions (metadata + document scan): {summary.award_match_count}")

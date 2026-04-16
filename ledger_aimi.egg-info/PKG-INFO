@@ -8,6 +8,7 @@ Requires-Dist: beautifulsoup4>=4.12.0
 Requires-Dist: cloudscraper>=1.2.71
 Requires-Dist: lxml>=5.2.0
 Requires-Dist: pypdf>=5.0.0
+Requires-Dist: reportlab>=4.2.0
 Requires-Dist: requests>=2.32.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
@@ -26,10 +27,19 @@ Enabled by default:
 2. OpenAlex
 3. Semantic Scholar
 4. Crossref
-5. arXiv
-6. Google Scholar
+5. DataCite
+6. Europe PMC
+7. PubMed
+8. OpenAIRE
+9. DOAJ
+10. arXiv
+11. InspireHEP
+12. Google Scholar
 
 For each source hit, Ledger stores normalized fields (title, year, DOI, authors, URLs, matched AIMI member, and source metadata), then deduplicates into canonical paper records.
+It also enriches `pdf_urls` from DOI/URL/source hints (including arXiv IDs like `10.48550/arXiv.2601.07742`).
+
+This gives broad journal/preprint coverage via major bibliographic indexes rather than scraping individual publisher sites one-by-one.
 
 ## Proxy policy
 
@@ -56,6 +66,35 @@ Optional overrides:
 uv run ledger --env-file .env --lookback-years 3 --member-limit 10
 ```
 
+Post-run PDF/A conversion (for already-detected award papers):
+
+```bash
+uv run ledger-pdfa-postprocess --env-file .env --run-dir output/latest
+```
+
+## Weekly cron run
+
+Use the bundled cron-safe wrapper (with lock + log file):
+
+```bash
+/Users/abm/XVOL/Cornell/AIMI/Ledger/scripts/run_weekly.sh /Users/abm/XVOL/Cornell/AIMI/Ledger/.env
+```
+
+Sample crontab entry is provided at:
+
+- `ops/cron/ledger_weekly.cron`
+
+## Proxy compatibility
+
+- Some providers force HTTPS endpoints and may fail with specific proxy exits.
+- Source toggles in `.env` let you run only compatible sources.
+- New broad sources (`OpenAIRE`, `DOAJ`) are page-capped by default (`LEDGER_MAX_OPENAIRE_PAGES`, `LEDGER_MAX_DOAJ_PAGES`) to keep runtime bounded.
+- The included `.env` is configured for reliable operation with the current proxy (`OpenAlex` enabled by default).
+- Re-enable other sources by setting the `LEDGER_ENABLE_*` flags to `true` (including `DATACITE`, `EUROPE_PMC`, `PUBMED`, `INSPIREHEP`, etc.).
+- Ledger probes each enabled source via proxy before collection and auto-skips unreachable sources (`LEDGER_PROBE_SOURCES_BEFORE_COLLECTION=true`).
+- arXiv is normalized to `http://export.arxiv.org/api/query` for better compatibility with rotating proxies.
+- For Google Scholar, set `LEDGER_SERPAPI_API_KEY` to use SerpAPI instead of direct scraping when Scholar blocks requests.
+
 ## Output layout
 
 Each run writes to `output/runs/<timestamp>/`:
@@ -65,16 +104,38 @@ Each run writes to `output/runs/<timestamp>/`:
 - `sources/openalex.json`
 - `sources/semantic_scholar.json`
 - `sources/crossref.json`
+- `sources/datacite.json`
+- `sources/europe_pmc.json`
+- `sources/pubmed.json`
+- `sources/openaire.json`
+- `sources/doaj.json`
 - `sources/arxiv.json`
+- `sources/inspirehep.json`
 - `sources/google_scholar.json`
 - `source_errors.json`
-- `papers_canonical.json`
+- `proxy_audit.json`
+- `award_document_summary.json`
 - `papers_with_award_mention.json`
-- `papers_without_award_mention.json`
 - `summary.json`
 - `report.md`
+- `target_doi_coverage.json` (when target DOIs are configured)
+- `award_verified/summary.json`
+- `award_verified/papers.json`
+- `award_verified/papers_with_award_mention.json`
+- `award_verified/pdf/*.pdf` (downloaded award-verified PDFs)
+- `award_verified/pdfa/*.pdf` (PDF/A outputs when conversion succeeds)
+- `paper_cache_snapshot.json` (all seen papers + hashes + lightweight scan metadata)
+- `paper_cache_delta.json` (new/changed paper IDs for the current run)
+
+By default, Ledger is award-focused and does **not** write large non-award archives.
+Set `LEDGER_WRITE_FULL_CORPUS_ARTIFACTS=true` to also write:
+
+- `papers_canonical.json`
+- `papers_without_award_mention.json`
 
 Latest snapshots are also copied to `output/latest/`.
+
+`award_document_summary.json` is compact and Slack-friendly: title/DOI/member/source/PDF URL + local PDF/PDF-A paths and conversion status (no abstract payloads).
 
 ## Standardized schema
 
@@ -95,8 +156,27 @@ Canonical papers (`papers_canonical.json`) include:
 - `source_records`
 - `award_mentioned_in_metadata`
 - `award_mentions`
+- `award_mentioned_in_document`
+- `document_award_mentions`
+- `document_award_context`
+- `document_verification_kind`
+- `document_verification_url`
+- `document_pdf_url`
+- `document_pdf_local_path`
+- `document_pdfa_path`
+- `document_pdfa_error`
+- `document_scan_error`
 
 ## Notes
 
 - Google Scholar can rate-limit or challenge traffic; Ledger records source errors and continues.
-- Award matching is metadata-based (title/abstract/snippet), not full-PDF acknowledgment extraction.
+- Award matching checks metadata and can also scan downloaded PDFs (`LEDGER_SCAN_PDFS_FOR_AWARDS=true`).
+- For strict DOI verification loops, set `LEDGER_SCAN_TARGET_DOIS_ONLY=true` to scan only configured target DOI papers.
+- Weekly discovery mode is cache-driven by default: Ledger stores paper hashes in `LEDGER_STATE_FILE` and only scans new/changed papers when `LEDGER_INCREMENTAL_SCAN_ONLY_NEW_OR_CHANGED=true`.
+- `papers_with_award_mention.json` is document-verified when document scan is enabled.
+- When document scanning is enabled, Ledger can convert award-containing PDFs to PDF/A (`LEDGER_CONVERT_AWARD_PDFS_TO_PDFA=true`) and records outcomes in `award_document_summary.json`.
+- PDF/A conversion uses Ghostscript (`LEDGER_GHOSTSCRIPT_BIN`, default `gs`); if unavailable, conversion errors are captured per document in the summary JSON.
+- You can re-run conversion after a crawl with `ledger-pdfa-postprocess` (useful after installing Ghostscript).
+- Default award regexes always include number-only matching for `2433348`.
+- Some publisher PDF endpoints return `HTTP 403` through proxy-only routing; Ledger now falls back to structured full-text XML (Europe PMC/PMC efetch) when available.
+- You can enforce expected-paper coverage by setting `LEDGER_TARGET_DOIS` or `LEDGER_TARGET_DOI_FILE` and enabling `LEDGER_FAIL_ON_MISSING_TARGET_DOIS=true`; the gate now enforces award-verified inclusion, not just DOI discovery.

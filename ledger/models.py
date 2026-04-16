@@ -124,6 +124,10 @@ class CollectionRunSummary:
     source_record_counts: dict[str, int]
     source_error_counts: dict[str, int]
     source_probe_status: dict[str, str]
+    state_cache_enabled: bool
+    state_new_paper_count: int
+    state_changed_paper_count: int
+    state_unchanged_paper_count: int
     raw_record_count: int
     canonical_paper_count: int
     award_match_count: int

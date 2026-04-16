@@ -259,6 +259,7 @@ class SourceSettings:
 class LedgerConfig:
     team_url: str = "https://aimi.cornell.edu/team/"
     output_dir: Path = Path("output")
+    state_file: Path = Path("output/state/paper_index.json")
     request_timeout_seconds: int = 25
     user_agent: str = "Ledger/2.0 (+AIMI publication aggregation)"
     expedition_path: str | None = "/Users/abm/XVOL/ABM/Projects/Code/Expedition"
@@ -280,6 +281,8 @@ class LedgerConfig:
     pdfa_fallback_copy: bool = False
     include_raw_payloads: bool = False
     write_full_corpus_artifacts: bool = False
+    enable_state_cache: bool = True
+    incremental_scan_only_new_or_changed: bool = True
     probe_sources_before_collection: bool = True
     fallback_member_names: list[str] = field(default_factory=lambda: list(DEFAULT_AIMI_MEMBER_NAMES))
 
@@ -330,6 +333,9 @@ class LedgerConfig:
         output_dir = Path(os.getenv("LEDGER_OUTPUT_DIR", "output")).expanduser()
         if not output_dir.is_absolute():
             output_dir = (env_file.parent / output_dir).resolve()
+        state_file = Path(os.getenv("LEDGER_STATE_FILE", str(defaults.state_file))).expanduser()
+        if not state_file.is_absolute():
+            state_file = (env_file.parent / state_file).resolve()
 
         proxy_url = _normalize_proxy_url(os.getenv("LEDGER_PROXY_URL"))
         proxy_http = _normalize_proxy_url(os.getenv("LEDGER_PROXY_HTTP"))
@@ -377,6 +383,7 @@ class LedgerConfig:
         config = cls(
             team_url=os.getenv("LEDGER_TEAM_URL", defaults.team_url),
             output_dir=output_dir,
+            state_file=state_file,
             request_timeout_seconds=max(1, _get_int("LEDGER_REQUEST_TIMEOUT_SECONDS", 25)),
             user_agent=os.getenv("LEDGER_USER_AGENT", defaults.user_agent),
             expedition_path=_clean_optional(os.getenv("LEDGER_EXPEDITION_PATH")) or defaults.expedition_path,
@@ -397,6 +404,11 @@ class LedgerConfig:
             pdfa_fallback_copy=_get_bool("LEDGER_PDFA_FALLBACK_COPY", False),
             include_raw_payloads=_get_bool("LEDGER_INCLUDE_RAW_PAYLOADS", False),
             write_full_corpus_artifacts=_get_bool("LEDGER_WRITE_FULL_CORPUS_ARTIFACTS", False),
+            enable_state_cache=_get_bool("LEDGER_ENABLE_STATE_CACHE", True),
+            incremental_scan_only_new_or_changed=_get_bool(
+                "LEDGER_INCREMENTAL_SCAN_ONLY_NEW_OR_CHANGED",
+                True,
+            ),
             probe_sources_before_collection=_get_bool("LEDGER_PROBE_SOURCES_BEFORE_COLLECTION", True),
             fallback_member_names=_parse_list_env("LEDGER_MEMBER_NAMES", DEFAULT_AIMI_MEMBER_NAMES),
             award_patterns=_parse_list_env("LEDGER_AWARD_PATTERNS", DEFAULT_AWARD_PATTERNS),

@@ -1,0 +1,12 @@
+# Ignore generated target-selection artifacts created during quarterly runs.
+*_dois.txt
+final_results_manifest.json
+*_final_results_manifest.json
+*summary*.json
+*summary*.md
+
+# Keep this checked in so the folder behavior is explicit.
+!.gitignore
+
+# Preserve the existing curated baseline file already tracked in the repo.
+!q1_dois.txt

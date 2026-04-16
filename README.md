@@ -51,6 +51,24 @@ Optional overrides:
 uv run ledger --env-file .env --lookback-years 3 --member-limit 10
 ```
 
+Post-run PDF/A conversion (for already-detected award papers):
+
+```bash
+uv run ledger-pdfa-postprocess --env-file .env --run-dir output/latest
+```
+
+## Weekly cron run
+
+Use the bundled cron-safe wrapper (with lock + log file):
+
+```bash
+/Users/abm/XVOL/Cornell/AIMI/Ledger/scripts/run_weekly.sh /Users/abm/XVOL/Cornell/AIMI/Ledger/.env
+```
+
+Sample crontab entry is provided at:
+
+- `ops/cron/ledger_weekly.cron`
+
 ## Proxy compatibility
 
 - Some providers force HTTPS endpoints and may fail with specific proxy exits.
@@ -91,6 +109,8 @@ Each run writes to `output/runs/<timestamp>/`:
 - `award_verified/papers_with_award_mention.json`
 - `award_verified/pdf/*.pdf` (downloaded award-verified PDFs)
 - `award_verified/pdfa/*.pdf` (PDF/A outputs when conversion succeeds)
+- `paper_cache_snapshot.json` (all seen papers + hashes + lightweight scan metadata)
+- `paper_cache_delta.json` (new/changed paper IDs for the current run)
 
 By default, Ledger is award-focused and does **not** write large non-award archives.
 Set `LEDGER_WRITE_FULL_CORPUS_ARTIFACTS=true` to also write:
@@ -137,9 +157,13 @@ Canonical papers (`papers_canonical.json`) include:
 - Google Scholar can rate-limit or challenge traffic; Ledger records source errors and continues.
 - Award matching checks metadata and can also scan downloaded PDFs (`LEDGER_SCAN_PDFS_FOR_AWARDS=true`).
 - For strict DOI verification loops, set `LEDGER_SCAN_TARGET_DOIS_ONLY=true` to scan only configured target DOI papers.
+- Weekly discovery mode is cache-driven by default: Ledger stores paper hashes in `LEDGER_STATE_FILE` and only scans new/changed papers when `LEDGER_INCREMENTAL_SCAN_ONLY_NEW_OR_CHANGED=true`.
 - `papers_with_award_mention.json` is document-verified when document scan is enabled.
 - When document scanning is enabled, Ledger can convert award-containing PDFs to PDF/A (`LEDGER_CONVERT_AWARD_PDFS_TO_PDFA=true`) and records outcomes in `award_document_summary.json`.
 - PDF/A conversion uses Ghostscript (`LEDGER_GHOSTSCRIPT_BIN`, default `gs`); if unavailable, conversion errors are captured per document in the summary JSON.
+- You can re-run conversion after a crawl with `ledger-pdfa-postprocess` (useful after installing Ghostscript).
+- You can build the curated end-of-run package with `uv run ledger-prepare-final-results --env-file .env --run-dir output/latest`; it writes `final_results/final_results.md`, `final_results/summary.json`, and `final_results/pdf{,a}/`.
+- The curated finalizer uses strict title-based dedupe against `papers_canonical.json`, reads the selected papers from `targets/final_results_manifest.json`, and falls back to generated text-snapshot PDFs when publisher PDF endpoints are blocked.
 - Default award regexes always include number-only matching for `2433348`.
 - Some publisher PDF endpoints return `HTTP 403` through proxy-only routing; Ledger now falls back to structured full-text XML (Europe PMC/PMC efetch) when available.
 - You can enforce expected-paper coverage by setting `LEDGER_TARGET_DOIS` or `LEDGER_TARGET_DOI_FILE` and enabling `LEDGER_FAIL_ON_MISSING_TARGET_DOIS=true`; the gate now enforces award-verified inclusion, not just DOI discovery.
