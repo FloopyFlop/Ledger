@@ -22,6 +22,7 @@ dev = [
 ledger = "ledger.cli:main"
 ledger-pdfa-postprocess = "ledger.postprocess_pdfa:main"
 ledger-prepare-final-results = "ledger.finalize_results:main"
+ledger-curate-manifest = "ledger.curate_manifest:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

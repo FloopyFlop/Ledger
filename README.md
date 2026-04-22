@@ -163,7 +163,9 @@ Canonical papers (`papers_canonical.json`) include:
 - PDF/A conversion uses Ghostscript (`LEDGER_GHOSTSCRIPT_BIN`, default `gs`); if unavailable, conversion errors are captured per document in the summary JSON.
 - You can re-run conversion after a crawl with `ledger-pdfa-postprocess` (useful after installing Ghostscript).
 - You can build the curated end-of-run package with `uv run ledger-prepare-final-results --env-file .env --run-dir output/latest`; it writes `final_results/final_results.md`, `final_results/summary.json`, and `final_results/pdf{,a}/`.
+- You can conservatively review candidate additions against the previously approved manifest with `uv run ledger-curate-manifest --run-dir output/latest --base-manifest targets/final_results_manifest.json --candidate-manifest <candidate.json> --output-dir targets`; it writes accepted additions, a cumulative bibliography manifest, a portal-only manifest, and a review summary.
 - The curated finalizer uses strict title-based dedupe against `papers_canonical.json`, reads the selected papers from `targets/final_results_manifest.json`, and falls back to generated text-snapshot PDFs when publisher PDF endpoints are blocked.
+- PDF/A generation now uses Ghostscript's `PDFA_def.ps` + ICC profile support files and validates outputs with `veraPDF` when available. Regular PDFs are no longer silently treated as PDF/A unless fallback copy is explicitly enabled.
 - Default award regexes always include number-only matching for `2433348`.
 - Some publisher PDF endpoints return `HTTP 403` through proxy-only routing; Ledger now falls back to structured full-text XML (Europe PMC/PMC efetch) when available.
 - You can enforce expected-paper coverage by setting `LEDGER_TARGET_DOIS` or `LEDGER_TARGET_DOI_FILE` and enabling `LEDGER_FAIL_ON_MISSING_TARGET_DOIS=true`; the gate now enforces award-verified inclusion, not just DOI discovery.

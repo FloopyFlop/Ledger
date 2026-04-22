@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 import shutil
 import subprocess
@@ -124,6 +125,13 @@ def convert_pdf_to_pdfa(
 ) -> tuple[bool, str | None]:
     destination_pdfa.parent.mkdir(parents=True, exist_ok=True)
 
+    support_files, support_error = _pdfa_support_files(ghostscript_bin)
+    if support_error:
+        return False, support_error
+    pdfa_def_template, icc_profile = support_files
+    pdfa_def_path = destination_pdfa.parent / f".{destination_pdfa.stem}.PDFA_def.ps"
+    pdfa_def_path.write_text(_render_pdfa_def(pdfa_def_template, icc_profile), encoding="utf-8")
+
     cmd = [
         ghostscript_bin,
         "-dPDFA=2",
@@ -131,26 +139,39 @@ def convert_pdf_to_pdfa(
         "-dNOPAUSE",
         "-dNOOUTERSAVE",
         "-sDEVICE=pdfwrite",
+        "-sColorConversionStrategy=RGB",
+        "-sProcessColorModel=DeviceRGB",
         "-dPDFACompatibilityPolicy=1",
+        f"--permit-file-read={icc_profile}",
+        f"--permit-file-read={pdfa_def_path}",
         f"-sOutputFile={destination_pdfa}",
+        str(pdfa_def_path),
         str(source_pdf),
     ]
 
     try:
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    except FileNotFoundError:
-        return False, f"Ghostscript binary not found: {ghostscript_bin}"
-    except Exception as exc:
-        return False, str(exc)
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        except FileNotFoundError:
+            return False, f"Ghostscript binary not found: {ghostscript_bin}"
+        except Exception as exc:
+            return False, str(exc)
 
-    if proc.returncode != 0:
-        stderr = proc.stderr.strip() or proc.stdout.strip() or "Ghostscript failed"
-        return False, stderr
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip() or proc.stdout.strip() or "Ghostscript failed"
+            return False, stderr
 
-    if not destination_pdfa.exists() or destination_pdfa.stat().st_size == 0:
-        return False, "Ghostscript finished but output PDF/A was not created"
+        if not destination_pdfa.exists() or destination_pdfa.stat().st_size == 0:
+            return False, "Ghostscript finished but output PDF/A was not created"
 
-    return True, None
+        validation_ok, validation_error = validate_pdfa(destination_pdfa)
+        if not validation_ok:
+            destination_pdfa.unlink(missing_ok=True)
+            return False, validation_error or "PDF/A validation failed"
+
+        return True, None
+    finally:
+        pdfa_def_path.unlink(missing_ok=True)
 
 
 
@@ -172,3 +193,82 @@ def _extract_arxiv_id(value: str) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def validate_pdfa(path: Path) -> tuple[bool, str | None]:
+    validator = shutil.which("verapdf")
+    if validator:
+        try:
+            proc = subprocess.run(
+                [validator, "--format", "text", str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            return False, f"veraPDF execution failed: {exc}"
+
+        output = (proc.stdout or "").strip()
+        if proc.returncode == 0 and output.startswith("PASS "):
+            return True, None
+        detail = output or (proc.stderr or "").strip() or "veraPDF reported a validation failure"
+        return False, detail
+
+    data = path.read_bytes()
+    required_markers = [
+        b"pdfaid:part",
+        b"pdfaid:conformance",
+        b"OutputIntent",
+    ]
+    missing = [marker.decode("latin1") for marker in required_markers if marker not in data]
+    if missing:
+        return False, "PDF/A markers missing: " + ", ".join(missing)
+    return True, None
+
+
+@functools.lru_cache(maxsize=8)
+def _pdfa_support_files(ghostscript_bin: str) -> tuple[tuple[Path, Path] | None, str | None]:
+    binary = shutil.which(ghostscript_bin) or ghostscript_bin
+    gs_path = Path(binary).expanduser().resolve()
+    candidates: list[Path] = []
+
+    for root in [
+        gs_path.parent.parent / "share" / "ghostscript",
+        Path("/opt/homebrew/share/ghostscript"),
+        Path("/usr/local/share/ghostscript"),
+        Path("/usr/share/ghostscript"),
+        Path("/opt/homebrew/Cellar/ghostscript"),
+        Path("/usr/local/Cellar/ghostscript"),
+    ]:
+        if root.exists():
+            candidates.append(root)
+
+    pdfa_def = _first_existing(candidates, "PDFA_def.ps")
+    icc_profile = _first_existing(candidates, "srgb.icc")
+    if pdfa_def is None or icc_profile is None:
+        return None, "Ghostscript PDF/A support files not found (need PDFA_def.ps and srgb.icc)"
+    return (pdfa_def, icc_profile), None
+
+
+def _first_existing(roots: list[Path], filename: str) -> Path | None:
+    for root in roots:
+        direct = root / "lib" / filename
+        if direct.exists():
+            return direct
+        direct = root / "iccprofiles" / filename
+        if direct.exists():
+            return direct
+        matches = list(root.rglob(filename))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _render_pdfa_def(template_path: Path, icc_profile: Path) -> str:
+    template = template_path.read_text(encoding="utf-8")
+    return re.sub(
+        r"/ICCProfile\s+\(srgb\.icc\)",
+        f"/ICCProfile ({icc_profile.as_posix()})",
+        template,
+        count=1,
+    )

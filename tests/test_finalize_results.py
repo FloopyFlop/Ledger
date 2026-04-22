@@ -3,11 +3,16 @@ from pathlib import Path
 from ledger.finalize_results import (
     FinalManifestItem,
     _compose_metadata_snapshot_text,
+    _crossref_pdf_candidates,
     _decode_openalex_abstract,
     _generate_snapshot_pdf,
     _group_papers,
+    _openalex_pdf_candidates,
+    _pdf_candidates_for_group,
+    _response_pdf_candidates,
     render_final_markdown,
 )
+from ledger.net import HttpResponse
 
 
 def test_group_papers_collapses_exact_title_duplicates() -> None:
@@ -116,3 +121,95 @@ def test_decode_openalex_abstract_reconstructs_token_order() -> None:
     )
 
     assert abstract == "Greenhouse for control diffusion"
+
+
+def test_crossref_pdf_candidates_extract_pdf_links() -> None:
+    message = {
+        "link": [
+            {"URL": "https://example.org/article.pdf", "content-type": "application/pdf"},
+            {"URL": "https://example.org/article", "content-type": "text/html"},
+            {"URL": "https://example.org/download/pdf", "content-type": "unspecified"},
+        ]
+    }
+
+    candidates = _crossref_pdf_candidates(message)
+
+    assert candidates == ["https://example.org/article.pdf", "https://example.org/download/pdf"]
+
+
+def test_openalex_pdf_candidates_collects_known_locations() -> None:
+    work = {
+        "open_access": {"oa_url": "https://example.org/landing"},
+        "best_oa_location": {
+            "pdf_url": "https://example.org/best.pdf",
+            "landing_page_url": "https://example.org/best",
+        },
+        "primary_location": {
+            "pdf_url": "https://example.org/primary.pdf",
+            "landing_page_url": "https://example.org/primary",
+        },
+        "locations": [
+            {"pdf_url": "https://example.org/location.pdf", "landing_page_url": "https://example.org/location"}
+        ],
+    }
+
+    candidates = _openalex_pdf_candidates(work)
+
+    assert candidates == [
+        "https://example.org/landing",
+        "https://example.org/best.pdf",
+        "https://example.org/best",
+        "https://example.org/primary.pdf",
+        "https://example.org/primary",
+        "https://example.org/location.pdf",
+        "https://example.org/location",
+    ]
+
+
+def test_response_pdf_candidates_extracts_meta_and_anchor_links() -> None:
+    response = HttpResponse(
+        url="https://example.org/article",
+        final_url="https://example.org/article",
+        status_code=200,
+        headers={},
+        body=(
+            b"<html><head><meta name='citation_pdf_url' content='/downloads/paper.pdf'></head>"
+            b"<body><a href='supplement.pdf'>PDF</a></body></html>"
+        ),
+        error=None,
+        content_type="text/html",
+    )
+
+    candidates = _response_pdf_candidates(response)
+
+    assert candidates == [
+        "https://example.org/downloads/paper.pdf",
+        "https://example.org/supplement.pdf",
+    ]
+
+
+def test_pdf_candidates_for_non_preprint_doi_skip_arxiv_and_supplements() -> None:
+    papers = [
+        {
+            "canonical_id": "doi:10.1000/example",
+            "title": "Published Example",
+            "doi": "10.1000/example",
+            "pdf_urls": [
+                "https://arxiv.org/pdf/2501.12345.pdf",
+                "https://static-content.springer.com/esm/art%3A10.1000%2Fexample/MediaObjects/example_MOESM1_ESM.pdf",
+                "https://publisher.example.org/article.pdf",
+            ],
+        }
+    ]
+    group = next(iter(_group_papers(papers).values()))
+    item = FinalManifestItem(
+        title="Published Example",
+        authors=["Author One"],
+        aimi_authors=["Author One"],
+        url="https://doi.org/10.1000/example",
+        doi="10.1000/example",
+    )
+
+    candidates = _pdf_candidates_for_group(group, item)
+
+    assert candidates == ["https://publisher.example.org/article.pdf"]

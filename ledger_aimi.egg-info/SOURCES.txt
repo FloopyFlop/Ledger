@@ -5,6 +5,7 @@ ledger/__main__.py
 ledger/cli.py
 ledger/collectors.py
 ledger/config.py
+ledger/curate_manifest.py
 ledger/dblp.py
 ledger/finalize_results.py
 ledger/funding.py
@@ -24,6 +25,7 @@ ledger_aimi.egg-info/entry_points.txt
 ledger_aimi.egg-info/requires.txt
 ledger_aimi.egg-info/top_level.txt
 tests/test_config.py
+tests/test_curate_manifest.py
 tests/test_dblp_matching.py
 tests/test_document_verification.py
 tests/test_finalize_results.py

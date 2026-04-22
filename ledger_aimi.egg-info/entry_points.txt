@@ -1,4 +1,5 @@
 [console_scripts]
 ledger = ledger.cli:main
+ledger-curate-manifest = ledger.curate_manifest:main
 ledger-pdfa-postprocess = ledger.postprocess_pdfa:main
 ledger-prepare-final-results = ledger.finalize_results:main

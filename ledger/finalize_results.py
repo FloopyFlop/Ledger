@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
+from bs4 import BeautifulSoup
 from reportlab.lib.colors import HexColor
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import LETTER
@@ -20,7 +21,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from .config import LedgerConfig
-from .net import HttpClient
+from .net import HttpClient, HttpResponse
 from .pdfs import convert_pdf_to_pdfa, download_pdf, ensure_pdfa_copy, safe_file_stem
 from .pipeline import _extract_arxiv_id, _extract_searchable_text_from_response
 
@@ -104,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pdfa-fallback-copy",
-        default="true",
+        default=None,
         help="If true, copy the source PDF into the PDF/A path when conversion fails.",
     )
     parser.add_argument(
@@ -135,7 +136,7 @@ def main() -> None:
     groups = _group_papers(papers)
     config_max_mb = args.pdf_download_max_mb or config.pdf_scan_max_mb
     ghostscript_bin = args.ghostscript_bin or config.ghostscript_bin
-    pdfa_fallback_copy = _bool_or_default(args.pdfa_fallback_copy, True)
+    pdfa_fallback_copy = _bool_or_default(args.pdfa_fallback_copy, config.pdfa_fallback_copy)
 
     client = HttpClient(
         proxy=config.proxy,
@@ -233,6 +234,8 @@ def _prepare_group_result(
     pdf_source_kind = None
     pdf_download_url = None
     pdf_error = None
+    crossref_message: dict[str, Any] | None = None
+    openalex_work: dict[str, Any] | None = None
 
     local_pdf = _find_existing_local_pdf(group)
     if local_pdf is not None:
@@ -248,6 +251,24 @@ def _prepare_group_result(
                 break
             pdf_error = error or "PDF download failed"
 
+        if pdf_source_kind is None:
+            crossref_message = _fetch_crossref_message(client=client, config=config, doi=item.doi)
+            openalex_work = _fetch_openalex_work(client=client, config=config, doi=item.doi)
+            for candidate in _discover_additional_pdf_candidates(
+                client=client,
+                group=group,
+                item=item,
+                crossref_message=crossref_message,
+                openalex_work=openalex_work,
+            ):
+                ok, error = download_pdf(client, candidate, pdf_path, max_pdf_mb=max_pdf_mb)
+                if ok:
+                    pdf_source_kind = "downloaded_pdf"
+                    pdf_download_url = candidate
+                    pdf_error = None
+                    break
+                pdf_error = error or "PDF download failed"
+
     snapshot_source = None
     snapshot_kind = None
     if pdf_source_kind is None:
@@ -258,6 +279,8 @@ def _prepare_group_result(
                 config=config,
                 group=group,
                 item=item,
+                crossref_message=crossref_message,
+                openalex_work=openalex_work,
             )
         if snapshot_text:
             _generate_snapshot_pdf(
@@ -333,11 +356,16 @@ def _prepare_group_result(
 
 def _pdf_candidates_for_group(group: PaperGroup, item: FinalManifestItem) -> list[str]:
     candidates: list[str] = []
-    _merge_strings(candidates, group.pdf_urls)
+    for candidate in group.pdf_urls:
+        if not isinstance(candidate, str):
+            continue
+        if _skip_pdf_candidate(candidate, doi=item.doi):
+            continue
+        _merge_strings(candidates, [candidate])
 
     for raw in [item.url, item.doi]:
         arxiv_id = _extract_arxiv_id(raw)
-        if arxiv_id:
+        if arxiv_id and _is_preprint_doi(item.doi):
             _merge_strings(candidates, [f"https://arxiv.org/pdf/{arxiv_id}.pdf"])
 
     clean: list[str] = []
@@ -346,6 +374,147 @@ def _pdf_candidates_for_group(group: PaperGroup, item: FinalManifestItem) -> lis
             continue
         clean.append(candidate)
     return clean
+
+
+def _discover_additional_pdf_candidates(
+    *,
+    client: HttpClient,
+    group: PaperGroup,
+    item: FinalManifestItem,
+    crossref_message: dict[str, Any] | None,
+    openalex_work: dict[str, Any] | None,
+) -> list[str]:
+    candidates: list[str] = []
+    _merge_strings(candidates, _crossref_pdf_candidates(crossref_message))
+    _merge_strings(candidates, _openalex_pdf_candidates(openalex_work))
+
+    landing_urls: list[str] = []
+    _merge_strings(landing_urls, group.urls)
+    _merge_strings(landing_urls, [item.url])
+    if item.doi:
+        _merge_strings(landing_urls, [f"https://doi.org/{item.doi}"])
+
+    for url in landing_urls:
+        response = client.fetch(
+            url,
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1"},
+        )
+        if response.error:
+            continue
+        if response.status_code and response.status_code >= 400:
+            continue
+        _merge_strings(candidates, _response_pdf_candidates(response))
+
+    existing = set(_pdf_candidates_for_group(group, item))
+    filtered: list[str] = []
+    for candidate in candidates:
+        if candidate in existing or "none" in candidate.lower():
+            continue
+        if _skip_pdf_candidate(candidate, doi=item.doi):
+            continue
+        filtered.append(candidate)
+    return filtered
+
+
+def _crossref_pdf_candidates(message: dict[str, Any] | None) -> list[str]:
+    if not isinstance(message, dict):
+        return []
+
+    candidates: list[str] = []
+    links = message.get("link")
+    if not isinstance(links, list):
+        return candidates
+
+    for row in links:
+        if not isinstance(row, dict):
+            continue
+        url = _clean_text(row.get("URL"))
+        if not url:
+            continue
+        content_type = _clean_text(row.get("content-type")).lower()
+        if "pdf" in content_type or _looks_like_pdf_url(url):
+            _merge_strings(candidates, [url])
+    return candidates
+
+
+def _openalex_pdf_candidates(work: dict[str, Any] | None) -> list[str]:
+    if not isinstance(work, dict):
+        return []
+
+    candidates: list[str] = []
+    open_access = work.get("open_access")
+    if isinstance(open_access, dict):
+        oa_url = _clean_text(open_access.get("oa_url"))
+        if oa_url:
+            _merge_strings(candidates, [oa_url])
+
+    for key in ("best_oa_location", "primary_location"):
+        location = work.get(key)
+        if not isinstance(location, dict):
+            continue
+        pdf_url = _clean_text(location.get("pdf_url"))
+        landing_page_url = _clean_text(location.get("landing_page_url"))
+        if pdf_url:
+            _merge_strings(candidates, [pdf_url])
+        if landing_page_url:
+            _merge_strings(candidates, [landing_page_url])
+
+    locations = work.get("locations")
+    if isinstance(locations, list):
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            pdf_url = _clean_text(location.get("pdf_url"))
+            landing_page_url = _clean_text(location.get("landing_page_url"))
+            if pdf_url:
+                _merge_strings(candidates, [pdf_url])
+            if landing_page_url:
+                _merge_strings(candidates, [landing_page_url])
+
+    return candidates
+
+
+def _response_pdf_candidates(response: HttpResponse) -> list[str]:
+    candidates: list[str] = []
+    base_url = response.final_url or response.url
+    body = response.body or b""
+    content_type = (response.content_type or "").lower()
+
+    if base_url.lower().endswith(".pdf") or "pdf" in content_type or body.startswith(b"%PDF"):
+        _merge_strings(candidates, [base_url])
+        return candidates
+
+    if not body:
+        return candidates
+
+    text = body.decode("utf-8", errors="replace")
+    if "<" not in text:
+        return candidates
+
+    try:
+        soup = BeautifulSoup(text, "lxml")
+    except Exception:
+        return candidates
+
+    for tag in soup.find_all("meta"):
+        name = _clean_text(tag.get("name")).lower()
+        prop = _clean_text(tag.get("property")).lower()
+        content = _clean_text(tag.get("content"))
+        if not content:
+            continue
+        if "citation_pdf_url" in {name, prop} or _looks_like_pdf_url(content):
+            _merge_strings(candidates, [urllib.parse.urljoin(base_url, content)])
+
+    for tag in soup.find_all(["a", "link", "iframe", "embed"]):
+        href = _clean_text(tag.get("href") or tag.get("src"))
+        if not href:
+            continue
+        rel = " ".join(tag.get("rel", [])) if tag.get("rel") else ""
+        kind = _clean_text(tag.get("type") or "")
+        if _looks_like_pdf_url(href) or "pdf" in rel.lower() or "pdf" in kind.lower():
+            _merge_strings(candidates, [urllib.parse.urljoin(base_url, href)])
+
+    return candidates
 
 
 def _fetch_snapshot_text(
@@ -393,6 +562,8 @@ def _build_metadata_snapshot_text(
     config: LedgerConfig,
     group: PaperGroup,
     item: FinalManifestItem,
+    crossref_message: dict[str, Any] | None = None,
+    openalex_work: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     abstracts: list[str] = []
     metadata_lines: list[str] = []
@@ -404,7 +575,8 @@ def _build_metadata_snapshot_text(
         snapshot_kind = "canonical_record_abstract"
         snapshot_source = "canonical_record_abstract"
 
-    crossref_message = _fetch_crossref_message(client=client, config=config, doi=item.doi)
+    if crossref_message is None:
+        crossref_message = _fetch_crossref_message(client=client, config=config, doi=item.doi)
     if crossref_message:
         abstract = _clean_display_text(crossref_message.get("abstract"), strip_period=False)
         if abstract:
@@ -420,7 +592,8 @@ def _build_metadata_snapshot_text(
             ],
         )
 
-    openalex_work = _fetch_openalex_work(client=client, config=config, doi=item.doi)
+    if openalex_work is None:
+        openalex_work = _fetch_openalex_work(client=client, config=config, doi=item.doi)
     if openalex_work:
         abstract = _decode_openalex_abstract(openalex_work.get("abstract_inverted_index"))
         if abstract:
@@ -823,6 +996,40 @@ def _snapshot_note(snapshot_kind: str) -> str:
 
 def _normalize_title(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _clean_display_text(value).lower())
+
+
+def _looks_like_pdf_url(value: str) -> bool:
+    lowered = value.lower()
+    if ".pdf" in lowered:
+        return True
+    path = urllib.parse.urlsplit(value).path.lower().rstrip("/")
+    return bool(path.endswith("/pdf") or "/pdf/" in path)
+
+
+def _skip_pdf_candidate(value: str, *, doi: str) -> bool:
+    lowered = value.lower()
+    if _looks_like_supplementary_pdf_url(lowered):
+        return True
+    if not _is_preprint_doi(doi) and "arxiv.org/pdf/" in lowered:
+        return True
+    return False
+
+
+def _looks_like_supplementary_pdf_url(value: str) -> bool:
+    markers = (
+        "mediaobjects",
+        "_mosem",
+        "_esm",
+        "supplement",
+        "supplementary",
+        "supporting-information",
+    )
+    return any(marker in value for marker in markers)
+
+
+def _is_preprint_doi(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith("10.48550/arxiv.") or lowered.startswith("10.1101/")
 
 
 def _clean_display_text(value: Any, *, strip_period: bool = True) -> str:
